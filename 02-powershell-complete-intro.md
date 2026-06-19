@@ -250,63 +250,34 @@ This distinction matters when you are reading PowerShell code. If you see single
 
 ---
 
-## Part D: PowerShell Security Features
+## Part D: Execution Policy - Hands-On Lab
 
-This is the important part for security testing. PowerShell has built-in security controls. Understanding what they do - and how they fail - is the foundation of everything that comes next.
+Execution Policy is a setting that controls whether PowerShell script files (.ps1 files) are allowed to run.
 
-### Execution Policy
+That is the definition. Now forget the definition and just do this:
 
-#### What is it?
+---
 
-Execution Policy is a setting that controls whether PowerShell scripts (.ps1 files) are allowed to run.
+### Step 1 - Check What Policy is Active Right Now
 
-When someone (like a company IT department) sets execution policy to "Restricted", PowerShell will refuse to run script files. You can still type individual commands interactively, but you cannot run a saved .ps1 script file.
-
-#### The Different Levels
-
-| Policy | What it Does |
-|--------|-------------|
-| `Restricted` | No scripts can run at all. Only interactive commands work. |
-| `AllSigned` | Scripts can only run if they have a valid digital signature from a trusted source. |
-| `RemoteSigned` | Scripts downloaded from the internet must be signed. Scripts you create locally can run without a signature. |
-| `Unrestricted` | All scripts run. Shows a warning for internet-downloaded scripts, but does not block them. |
-| `Bypass` | Nothing is blocked. No warnings. No prompts. Scripts always run. |
-
-**The default on Windows 11:** `Restricted`
-
-This means out of the box, you cannot run PowerShell scripts by double-clicking or calling them from the command line.
-
-#### The Critical Misunderstanding
-
-Many companies set execution policy to `Restricted` and think their systems are protected. They are not.
-
-Microsoft itself states in their documentation: execution policy is **not a security feature**. It is a convenience feature designed to prevent accidental script execution.
-
-Here is proof: you can override the execution policy for a single session with one parameter:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File myscript.ps1
-```
-
-This runs `myscript.ps1` regardless of what the system-wide execution policy says. No admin rights needed.
-
-Execution policy is a speed bump, not a wall. It stops accidents. It does not stop intentional attacks.
-
-#### How to Check the Current Policy
-
-Open PowerShell and type:
+Open PowerShell and run:
 
 ```powershell
 Get-ExecutionPolicy
 ```
 
-To see the policy at every scope level:
+You will see:
+```
+Restricted
+```
+
+Now run this to see all scope levels:
 
 ```powershell
 Get-ExecutionPolicy -List
 ```
 
-Output will look like this:
+You will see something like this:
 
 ```
         Scope ExecutionPolicy
@@ -315,62 +286,127 @@ MachinePolicy       Undefined
    UserPolicy       Undefined
       Process       Undefined
   CurrentUser       Undefined
- LocalMachine      Restricted
+ LocalMachine       Undefined
 ```
 
-Each scope is checked from top to bottom. The first one that is not `Undefined` wins. `MachinePolicy` (set by Group Policy) takes highest priority.
+All `Undefined`. But `Get-ExecutionPolicy` still returned `Restricted`. Why?
 
-### Script Signing - What is it?
+Because when every scope is `Undefined`, Windows defaults to `Restricted`. It is the fallback. You do not need to explicitly set it - it kicks in automatically.
 
-Digital signing is a way to prove that a file came from a specific person or organization and has not been changed since it was signed.
+The policy scopes work like a priority list. Windows checks from top to bottom. First one that is not `Undefined` wins. `MachinePolicy` (set by Group Policy) has the highest priority. `LocalMachine` has the lowest.
 
-Think of it like a wax seal on a letter. The seal proves who sent it and that nobody opened the letter in transit.
+---
 
-When execution policy is set to `AllSigned`, PowerShell checks for this seal on every script. If the seal is missing or from an untrusted source, the script does not run.
+### Step 2 - Create a Script File
 
-In practice, very few organizations enforce `AllSigned` because it requires managing code signing certificates and signing every internal script. The overhead is significant.
+Open **Notepad** (not PowerShell - just Notepad from the Start menu).
 
-### Constrained Language Mode (CLM)
+Type this:
 
-This is more powerful than execution policy - and more relevant to AppLocker bypasses.
+```
+Write-Host "This script is running!"
+Write-Host "User: $env:USERNAME"
+Write-Host "Computer: $env:COMPUTERNAME"
+```
 
-#### What is it?
+Now save it.
 
-Constrained Language Mode locks down what PowerShell can do, even while it is running.
+When saving: click **File > Save As**, change the filename to `C:\test.ps1`, and change **Save as type** to **All Files** (not Text Documents). If you leave it as Text Documents, Notepad adds `.txt` and you get `test.ps1.txt` which will not work.
 
-In normal (Full Language) mode, PowerShell can:
-- Access any .NET class
-- Create COM objects
-- Load external code into memory
-- Do essentially anything Windows allows
+Verify the file exists:
 
-In Constrained Language Mode, PowerShell is restricted:
-- Cannot access most .NET classes
-- Cannot create COM objects
-- Cannot compile and run C# code inline
-- Cannot load arbitrary assemblies from memory
+```powershell
+Get-Item C:\test.ps1
+```
 
-#### How Does AppLocker Trigger CLM?
+Expected output:
+```
+    Directory: C:\
 
-This is the connection between AppLocker and PowerShell.
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------  ----
+-a----        19/06/2026   10:15              85   test.ps1
+```
 
-When AppLocker has script rules active and a script is not on the approved list, PowerShell does not just block the script. It also puts itself into Constrained Language Mode for the rest of that session.
+Good. The file is there.
 
-This means even if an attacker finds a way to run a script, CLM limits what that script can actually do.
+---
 
-Or at least, that is how it is supposed to work. You will learn the bypass methods in File 05.
+### Step 3 - Try to Run It. Watch It Fail.
 
-### AMSI - The Content Scanner
+In PowerShell, run:
 
-AMSI stands for Antimalware Scan Interface.
+```powershell
+C:\test.ps1
+```
 
-When you run a PowerShell command, AMSI takes the content of that command and sends it to your antivirus software for inspection - before the command runs. If the antivirus flags it as malicious, AMSI blocks execution.
+Expected output:
+```
+C:\test.ps1 : File C:\test.ps1 cannot be loaded because running scripts is disabled
+on this system. For more information, see about_Execution_Policies at
+https://go.microsoft.com/fwlink/?LinkID=135170.
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+```
 
-The important thing about AMSI: it scans the actual code, not just the file. This means even if you encode or obfuscate a script, PowerShell decodes it first and then AMSI scans the decoded version. You cannot hide malicious code from AMSI just by encoding it.
+Blocked. Execution policy stopped it.
 
-This is why AMSI bypass is a separate topic from execution policy bypass. They protect against different things.
+This is the intended behavior. A regular user accidentally running a malicious script they downloaded gets stopped here. That is what execution policy is designed for - accidents.
 
-The details of AMSI bypass are covered in File 05. For now, just know it exists and what it does.
+---
+
+### Step 4 - Bypass It With One Flag
+
+Run this:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\test.ps1
+```
+
+Expected output:
+```
+This script is running!
+User: Administrator
+Computer: WIN11-LAB
+```
+
+The script ran.
+
+You bypassed execution policy with one flag. No admin rights needed. No password prompt. Nothing.
+
+---
+
+### Step 5 - Confirm the Policy Did Not Change
+
+Now run this again:
+
+```powershell
+Get-ExecutionPolicy
+```
+
+Still shows:
+```
+Restricted
+```
+
+The system-wide policy is untouched. You did not change anything permanently. You just told PowerShell: for this one command, skip the policy check.
+
+This is exactly how attackers use it. They do not sit there trying to change system settings (which requires admin rights and leaves logs). They just add `-ExecutionPolicy Bypass` to every command they run.
+
+---
+
+### What This Means
+
+Execution policy is not security. Microsoft's own documentation says it is a **"safety feature"** - designed to prevent accidents, not attacks.
+
+If you are a company relying on execution policy to stop malicious scripts: it will not. Any person who knows that flag can bypass it in 5 seconds.
+
+The real security controls that actually matter are:
+- **AppLocker** - controls which programs and scripts are allowed to run at all (covered in File 03)
+- **AMSI** - scans the content of commands before they execute (even bypassed scripts get scanned)
+- **Constrained Language Mode** - limits what PowerShell can do even when running
+
+Those three are what attackers actually have to fight. Execution policy is just the first speed bump.
 
 ---
 
@@ -514,78 +550,7 @@ You can use `Get-Help` on any cmdlet. It is the single most useful command to kn
 
 ---
 
-## Part F: Lab - Create and Run Your First Script
-
-A script is just a text file containing PowerShell commands. The file has a `.ps1` extension.
-
-### Step 1: Create the Script
-
-Open Notepad (not PowerShell - just regular Notepad).
-
-Type this exactly:
-
-```
-Write-Host "Hello from PowerShell"
-Write-Host "Current user: $env:USERNAME"
-Write-Host "Computer name: $env:COMPUTERNAME"
-```
-
-`Write-Host` prints text to the screen. `$env:USERNAME` and `$env:COMPUTERNAME` are environment variables - Windows stores your username and computer name in these automatically.
-
-Save the file as `C:\script.ps1`
-
-Important: when saving in Notepad, change "Save as type" from "Text Documents (*.txt)" to "All Files (*.*)" - otherwise Notepad adds `.txt` to the end and you get `script.ps1.txt`.
-
-### Step 2: Try to Run It - Expect Failure
-
-Open PowerShell and type:
-
-```powershell
-C:\script.ps1
-```
-
-Expected output:
-```
-File C:\script.ps1 cannot be loaded because running scripts is disabled on this system.
-For more information, see about_Execution_Policies at https://go.microsoft.com/fwlink/?LinkID=135170.
-    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
-    + FullyQualifiedErrorId : UnauthorizedAccess
-```
-
-The script was blocked. Execution policy is set to `Restricted`.
-
-This is the defense working as intended. Now bypass it.
-
-### Step 3: Bypass Execution Policy and Run It
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\script.ps1
-```
-
-Expected output:
-```
-Hello from PowerShell
-Current user: User
-Computer name: DESKTOP-XXXXXXX
-```
-
-The script ran. You bypassed execution policy with a single parameter.
-
-This is a critical lesson: **execution policy is not a security boundary.** It stopped an accidental double-click. It did not stop an intentional bypass.
-
-### Step 4: Understand What Just Happened
-
-The `-ExecutionPolicy Bypass` parameter tells PowerShell: "For this one run, ignore the system's execution policy and just run the script."
-
-This does not change the system-wide policy. If you open a new PowerShell window and run `Get-ExecutionPolicy`, it still says `Restricted`. But for the duration of that one command, the policy was bypassed.
-
-This is how attackers run malicious scripts on locked-down systems. They do not change the policy permanently (which would be noisy and require admin rights). They just pass `-ExecutionPolicy Bypass` for each command they need to run.
-
-Document what you found:
-- What did the error say when execution policy blocked the script?
-- What exact command bypassed it?
-- Did you need admin rights to bypass it?
-- Could a regular user (not administrator) do this?
+## Part F: Three More Things to Know Before AppLocker
 
 ---
 
