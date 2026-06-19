@@ -34,13 +34,14 @@ The problem? The bouncer does not check the back door. This guide shows you wher
 
 ## What You Will Learn
 
-Five bypass methods:
+Six bypass methods:
 
 1. **LOLBins** - Using trusted Windows tools to run code AppLocker does not watch
 2. **PowerShell Bypasses** - Encoding and running scripts in ways AppLocker does not catch
 3. **DLL Hijacking** - Placing fake code libraries where real ones are expected
 4. **COM Object Abuse** - Using internal Windows communication objects to run commands
-5. **Full Attack Chain** - Combining everything into a real attack scenario
+5. **AMSI Bypass** - Disabling the antimalware scanner so malicious scripts are not detected
+6. **Full Attack Chain** - Combining everything into a real attack scenario
 
 ---
 
@@ -60,13 +61,14 @@ Setup instructions are in [01-lab-setup.md](./01-lab-setup.md).
 |------|-------|------|
 | 01 | Lab Setup | 60-90 min |
 | 02 | PowerShell Intro | 45-60 min |
-| 03 | AppLocker Deep Dive + Setup | 45-60 min |
+| 03 | AppLocker Deep Dive + Setup | 60-90 min |
 | 04 | LOLBins Lab | 60-90 min |
 | 05 | PowerShell Bypass Lab | 60-90 min |
 | 06 | DLL Hijacking Lab | 60-90 min |
 | 07 | COM Objects Lab | 45-60 min |
-| 08 | Full Attack Chain | 60-90 min |
-| **Total** | | **6-8 hours** |
+| 08 | AMSI Bypass Lab | 45-60 min |
+| 09 | Full Attack Chain | 60-90 min |
+| **Total** | | **7-9 hours** |
 
 ---
 
