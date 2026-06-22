@@ -117,7 +117,10 @@ def ask_filename(prompt, default, extension):
     while True:
         raw = ask(prompt, default)
         # Strip extension if user accidentally typed it
-        raw = raw.rstrip(extension).rstrip(".")
+        if raw.lower().endswith(extension.lower()):
+            raw = raw[:-len(extension)]
+        if raw.endswith("."):
+            raw = raw[:-1]
         name, err = validate_filename(raw)
         if err:
             warn(f"Invalid filename: {err}")
